@@ -34,3 +34,7 @@ docs/PPP_ANALYSIS.md
 # OS
 .DS_Store
 Thumbs.db
+
+#eim
+eim_config.toml
+examples/basic_connect/eim_config.toml

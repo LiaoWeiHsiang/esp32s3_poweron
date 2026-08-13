@@ -20,6 +20,7 @@
 #include "esp_err.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include "esp_http_server.h"
 
 #ifdef CONFIG_ML_ENABLE_CONFIG_HTTPD
 
@@ -100,6 +101,7 @@ typedef struct __attribute__((packed)) {
 /* Opaque context */
 typedef struct ml_config_ctx ml_config_ctx_t;
 
+httpd_handle_t ml_config_httpd_get_handle(void);
 /* ============================================================================
  * Lifecycle API
  * ========================================================================== */

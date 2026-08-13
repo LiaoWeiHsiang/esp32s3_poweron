@@ -38,6 +38,8 @@ static const char *TAG = "ml_config";
 /* Embedded HTML page */
 #include "ml_config_html.h"
 
+static ml_config_ctx_t *g_config_ctx = NULL;
+
 /* NVS namespace and keys */
 #define NVS_NAMESPACE    "ml_config"
 #define NVS_KEY_SETTINGS "settings"
@@ -1102,6 +1104,8 @@ esp_err_t ml_config_httpd_start(ml_config_ctx_t *ctx, microlink_t *ml) {
     if (!ctx) return ESP_ERR_INVALID_ARG;
     ctx->ml = ml;
 
+    g_config_ctx = ctx; // <-- 新增這行：將 ctx 保存到全域指標
+
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 6144;
     config.max_uri_handlers = 14;
@@ -1158,4 +1162,10 @@ void ml_config_httpd_deinit(ml_config_ctx_t *ctx) {
     free(ctx);
 }
 
+httpd_handle_t ml_config_httpd_get_handle(void) {
+    if (g_config_ctx != NULL) {
+        return g_config_ctx->httpd;
+    }
+    return NULL;
+}
 #endif /* CONFIG_ML_ENABLE_CONFIG_HTTPD */
