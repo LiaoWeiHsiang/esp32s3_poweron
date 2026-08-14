@@ -77,78 +77,75 @@ Production-ready Tailscale VPN client for the ESP32 platform with WiFi and 4G ce
 
 MicroLink uses standard ESP-IDF APIs — any ESP32 variant with WiFi and sufficient RAM should work. ESP32-P4, ESP32-C3, ESP32-C6, etc. Boards with PSRAM are recommended for large tailnets (100+ peers).
 
-## Quick Start
+## Getting Started (Fresh Clone → Working ESP32-S3)
 
-### 1. Clone and enter an example
+These are the concrete steps to get from `git clone` to a flashed, Tailscale-connected
+board. `basic_connect` is the example used below; swap in `cellular_connect`,
+`cellular_heartbeat`, or `failover_connect` if you need those instead.
 
-```bash
-git clone https://github.com/CamM2325/microlink.git
-cd microlink/examples/basic_connect    # or: cellular_connect, cellular_heartbeat, failover_connect
-```
-
-### 2. Configure sdkconfig
-
-Add these settings to your `sdkconfig.defaults` file:
-
-```ini
-# PSRAM Configuration (required for ESP32-S3 with PSRAM)
-CONFIG_SPIRAM=y
-CONFIG_SPIRAM_MODE_OCT=y
-CONFIG_SPIRAM_TYPE_AUTO=y
-CONFIG_SPIRAM_SPEED_80M=y
-CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
-
-# Partition table (app needs ~1MB+)
-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
-
-# TLS/HTTPS (required for DERP and control plane)
-CONFIG_ESP_TLS_USING_MBEDTLS=y
-CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
-CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
-CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
-
-# Networking
-CONFIG_LWIP_IPV4=y
-CONFIG_LWIP_IP4_FRAG=y
-CONFIG_LWIP_IP4_REASSEMBLY=y
-
-# Stack size
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
-```
-
-### 3. Configure credentials
+### 0. Clone
 
 ```bash
+git clone https://github.com/LiaoWeiHsiang/esp32s3_poweron.git
+cd esp32s3_poweron
+```
+
+### 1. Install ESP-IDF v5.3.1 (one-time, per machine)
+
+- **Linux/macOS**: install via [ESP-IDF's official installer](https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32s3/get-started/index.html) or the `eim` tool, targeting `esp32s3`.
+- **Windows**: see [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md) for full clone + `install.bat esp32s3` steps (including the Windows-on-ARM/corporate-proxy notes).
+
+### 2. Set up credentials (required every fresh clone — this file is git-ignored)
+
+```bash
+cd examples/basic_connect
 cp sdkconfig.credentials.example sdkconfig.credentials
-# Edit sdkconfig.credentials with your WiFi SSID/password, Tailscale auth key, etc.
 ```
 
-Or run `idf.py menuconfig` → MicroLink V2 → Credentials to set them interactively.
+Edit `sdkconfig.credentials` and fill in your WiFi SSID/password and Tailscale auth key
+(get one from https://login.tailscale.com/admin/settings/keys). Without this step the
+firmware will boot but loop on `Wi-Fi disconnected, reconnecting...`.
 
-Credentials are stored in `sdkconfig` (which is gitignored) so they are never accidentally committed to version control.
+### 3. Build and flash
 
-### 4. Build and flash
+**Linux**
 
 ```bash
-source ~/esp/esp-idf/export.sh
-idf.py build
-idf.py -p /dev/ttyACM0 flash monitor
+./build_and_flash.sh
 ```
 
-### 5. Test
+Edit the device path at the top of the script if your board isn't `/dev/ttyACM0`.
+
+**macOS**
+
+```bash
+./build_and_flash_mac.sh
+```
+
+Edit the device path at the top of the script if your board isn't `/dev/cu.usbmodem1101`.
+
+**Windows** (from `cmd.exe` or PowerShell)
+
+```bat
+build_and_flash_windows.cmd -p COM<N>
+```
+
+Find your COM port with `mode`, or `Get-CimInstance Win32_SerialPort | Select-Object DeviceID, Description`.
+
+All three scripts build, flash, and open the serial monitor (`Ctrl-]` to exit).
+
+### 4. Verify
 
 From any device on your tailnet:
 
 ```bash
-tailscale ping esp32-microlink
+tailscale ping <device-name>
 ```
 
 You should see:
 
 ```
-pong from esp32-microlink (100.x.x.x) via DERP(dfw) in 150ms
+pong from <device-name> (100.x.x.x) via DERP(dfw) in 150ms
 ```
 
 ## Memory Footprint

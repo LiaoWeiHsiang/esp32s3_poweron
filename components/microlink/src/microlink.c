@@ -505,6 +505,21 @@ rebind_wg_update:
     return ESP_OK;
 }
 
+void microlink_set_default_wifi_list(microlink_t *ml, const char (*ssids)[33],
+                                      const char (*passwords)[65], uint8_t count) {
+    if (!ml || !ssids || !passwords) return;
+    if (count > ML_CONFIG_MAX_DEFAULT_WIFI) count = ML_CONFIG_MAX_DEFAULT_WIFI;
+
+    ml_config_wifi_entry_t entries[ML_CONFIG_MAX_DEFAULT_WIFI];
+    for (uint8_t i = 0; i < count; i++) {
+        strncpy(entries[i].ssid, ssids[i], sizeof(entries[i].ssid) - 1);
+        entries[i].ssid[sizeof(entries[i].ssid) - 1] = '\0';
+        strncpy(entries[i].pass, passwords[i], sizeof(entries[i].pass) - 1);
+        entries[i].pass[sizeof(entries[i].pass) - 1] = '\0';
+    }
+    ml_config_set_default_wifi(ml->config_httpd, entries, count);
+}
+
 esp_err_t microlink_stop(microlink_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
 

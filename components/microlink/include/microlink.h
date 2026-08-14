@@ -123,6 +123,21 @@ esp_err_t microlink_start(microlink_t *ml);
 esp_err_t microlink_rebind(microlink_t *ml);
 
 /**
+ * @brief Register firmware-baked default WiFi networks for the config web UI
+ * @param ml Handle (must be past microlink_init())
+ * @param ssids Array of SSIDs (max 32 chars each)
+ * @param passwords Array of passwords (max 64 chars each, parallel to ssids)
+ * @param count Number of entries (max ML_CONFIG_MAX_DEFAULT_WIFI, currently 8)
+ *
+ * These are compiled into the app, not stored in NVS. They're surfaced
+ * read-only via the web UI (GET /api/wifi "defaults") so they show up
+ * grayed out and non-editable, alongside the user-editable NVS list.
+ * No-op if CONFIG_ML_ENABLE_CONFIG_HTTPD is disabled.
+ */
+void microlink_set_default_wifi_list(microlink_t *ml, const char (*ssids)[33],
+                                      const char (*passwords)[65], uint8_t count);
+
+/**
  * @brief Stop and disconnect from Tailscale
  * @param ml Handle
  * @return ESP_OK on success

@@ -65,6 +65,10 @@ struct ml_config_ctx {
     /* WiFi multi-SSID list */
     ml_config_wifi_list_t wifi_list;
 
+    /* Firmware-baked default WiFi networks (read-only, higher priority) */
+    ml_config_wifi_entry_t default_wifi[ML_CONFIG_MAX_DEFAULT_WIFI];
+    uint8_t default_wifi_count;
+
     /* Temperature sensor */
     temperature_sensor_handle_t temp_sensor;
 
@@ -796,6 +800,17 @@ static esp_err_t handler_get_wifi(httpd_req_t *req) {
 
     cJSON *json = cJSON_CreateObject();
     if (!json) return ESP_FAIL;
+
+    cJSON *defaults = cJSON_AddArrayToObject(json, "defaults");
+    for (int i = 0; i < ctx->default_wifi_count && i < ML_CONFIG_MAX_DEFAULT_WIFI; i++) {
+        cJSON *entry = cJSON_CreateObject();
+        if (!entry) continue;
+        cJSON_AddStringToObject(entry, "ssid", ctx->default_wifi[i].ssid);
+        cJSON_AddStringToObject(entry, "pass",
+            ctx->default_wifi[i].pass[0] ? "********" : "");
+        cJSON_AddItemToArray(defaults, entry);
+    }
+
     cJSON *arr = cJSON_AddArrayToObject(json, "networks");
 
     for (int i = 0; i < ctx->wifi_list.count && i < ML_CONFIG_MAX_WIFI_ENTRIES; i++) {
@@ -944,6 +959,14 @@ bool ml_config_get_wifi_list(ml_config_wifi_list_t *list) {
 
     free(settings);
     return false;
+}
+
+void ml_config_set_default_wifi(ml_config_ctx_t *ctx, const ml_config_wifi_entry_t *entries, uint8_t count) {
+    if (!ctx || !entries) return;
+    if (count > ML_CONFIG_MAX_DEFAULT_WIFI) count = ML_CONFIG_MAX_DEFAULT_WIFI;
+    memcpy(ctx->default_wifi, entries, count * sizeof(ml_config_wifi_entry_t));
+    ctx->default_wifi_count = count;
+    ESP_LOGI(TAG, "Default WiFi list registered: %d network(s)", (int)count);
 }
 
 /* ============================================================================
@@ -1108,7 +1131,7 @@ esp_err_t ml_config_httpd_start(ml_config_ctx_t *ctx, microlink_t *ml) {
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 6144;
-    config.max_uri_handlers = 14;
+    config.max_uri_handlers = 20; /* 12 config-httpd URIs + 5 attached from main.c, plus headroom */
     config.uri_match_fn = httpd_uri_match_wildcard;
 
     esp_err_t err = httpd_start(&ctx->httpd, &config);

@@ -212,6 +212,23 @@ bool ml_config_get_nvs_apn(char *apn, size_t apn_len);
  */
 bool ml_config_get_wifi_list(ml_config_wifi_list_t *list);
 
+/* ============================================================================
+ * Default WiFi List (firmware-baked, higher priority than the web UI list)
+ * ========================================================================== */
+
+#define ML_CONFIG_MAX_DEFAULT_WIFI  8
+
+/**
+ * @brief Register the firmware's built-in default WiFi networks
+ *
+ * These are compiled into the app (not stored in NVS) and are always tried
+ * before the web UI's editable list. They're surfaced read-only via
+ * GET /api/wifi so the UI can display them (grayed out, not editable).
+ *
+ * Call once at boot, after ml_config_httpd_init(), before ml_config_httpd_start().
+ */
+void ml_config_set_default_wifi(ml_config_ctx_t *ctx, const ml_config_wifi_entry_t *entries, uint8_t count);
+
 #ifdef __cplusplus
 }
 #endif
@@ -244,6 +261,7 @@ static inline bool ml_config_get_nvs_wifi(char *s, size_t sl, char *p, size_t pl
 static inline bool ml_config_get_nvs_ppp(char *u, size_t ul, char *p, size_t pl) { (void)u;(void)ul;(void)p;(void)pl; return false; }
 static inline bool ml_config_get_nvs_apn(char *a, size_t al) { (void)a;(void)al; return false; }
 static inline bool ml_config_get_wifi_list(ml_config_wifi_list_t *l) { (void)l; return false; }
+static inline void ml_config_set_default_wifi(ml_config_ctx_t *c, const ml_config_wifi_entry_t *e, uint8_t n) { (void)c;(void)e;(void)n; }
 
 /* Getter stubs (all return NULL/0 when config httpd disabled) */
 static inline const char *ml_config_get_wifi_ssid(const ml_config_ctx_t *c) { (void)c; return NULL; }

@@ -24,12 +24,16 @@
 #include "cJSON.h"
 
 #include "microlink.h"
+#include "ml_config_httpd.h"
 
 static const char *TAG = "main";
 
-/* === Tailscale API 設定 === */
-#define TAILSCALE_API_KEY      "tskey-api-kkx3iVRJTb11CNTRL-r4QBUHuvqxEJxUiUrGqtwEYrf117xLdD" // 替換為您的 Tailscale API Key
-#define TAILSCALE_TAILNET      "zxc741852741@gmail.com"                                   // 替換為您的 Tailnet 名稱/Email
+/* === Tailscale API 設定 ===
+ * The API key is supplied through sdkconfig (git-ignored), never committed
+ * in source code. Configure CONFIG_ML_TAILSCALE_API_KEY in menuconfig or
+ * sdkconfig.credentials before building.
+ */
+#define TAILSCALE_TAILNET      "zxc741852741@gmail.com"  // Tailnet 名稱/Email
 
 /* === 繼電器硬體設定 === */
 #define RELAY_GPIO           GPIO_NUM_4   // 繼電器控制腳位
@@ -42,14 +46,36 @@ static const char *TAG = "main";
 static TimerHandle_t relay_timer = NULL;
 static httpd_handle_t server_handle = NULL;
 
-/* WiFi credentials */
-static char wifi_ssid[33]     = CONFIG_ML_WIFI_SSID;
-static char wifi_password[65] = CONFIG_ML_WIFI_PASSWORD;
+/* WiFi network list — firmware-baked defaults (always tried first, not
+ * user-editable) followed by the web UI's NVS-backed list (lower priority,
+ * editable at http://<vpn-ip>/ -> WiFi Networks). Tries each in order until
+ * one connects, and keeps cycling through the combined list on disconnect. */
+#define WIFI_DEFAULT_COUNT   4
+#define WIFI_MAX_NETWORKS    (WIFI_DEFAULT_COUNT + ML_CONFIG_MAX_WIFI_ENTRIES)
+
+typedef struct {
+    char ssid[33];
+    char password[65];
+} wifi_cred_t;
+
+/* Built-in default networks — tried before anything added via the web UI. */
+static const wifi_cred_t k_default_wifi_creds[WIFI_DEFAULT_COUNT] = {
+    { "EnglishTsai",     "22222222" },
+    { "Developer",       "22222222" },
+    { "wifi-671",        "035596933" },
+    { "wifi-671_2.4G",   "035596933" },
+    //{ "Hydra",           "K5x48Vz3" },
+};
+
+static wifi_cred_t g_wifi_creds[WIFI_MAX_NETWORKS];
+static size_t g_wifi_count = 0;
+static size_t g_wifi_next_idx = 0;
 
 static EventGroupHandle_t wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 
 static microlink_t *ml = NULL;
+static bool g_ml_started = false;
 
 /* ============================================================================
  * 系統日誌與狀態追蹤 (System Tracker)
@@ -217,7 +243,7 @@ static void fetch_tailscale_devices_task(void *pvParameters) {
 
         esp_http_client_config_t config = {
             .url = url,
-            .username = TAILSCALE_API_KEY,
+            .username = CONFIG_ML_TAILSCALE_API_KEY,
             .password = "",
             .auth_type = HTTP_AUTH_TYPE_BASIC,
             .event_handler = _http_event_handler,
@@ -256,7 +282,7 @@ static void fetch_tailscale_devices_task(void *pvParameters) {
 
 static void relay_timer_callback(TimerHandle_t xTimer) {
     gpio_set_level(RELAY_GPIO, RELAY_INACTIVE_LEVEL);
-    ESP_LOGI(TAG, "⚡ Relay RELEASED (Power button released)");
+    ESP_LOGI(TAG, "Relay RELEASED (Power button released)");
 }
 
 static void init_relay_hardware(void) {
@@ -277,7 +303,7 @@ static void init_relay_hardware(void) {
 static void trigger_relay_async(uint32_t duration_ms, const char *action_desc) {
     if (!relay_timer) return;
     gpio_set_level(RELAY_GPIO, RELAY_ACTIVE_LEVEL);
-    ESP_LOGI(TAG, "⚡ Relay ACTIVATED for %lu ms (%s)", (unsigned long)duration_ms, action_desc);
+    ESP_LOGI(TAG, "Relay ACTIVATED for %lu ms (%s)", (unsigned long)duration_ms, action_desc);
 
     g_relay_log.last_trigger_ms = (uint32_t)(esp_timer_get_time() / 1000000);
     snprintf(g_relay_log.last_action, sizeof(g_relay_log.last_action), "%s (%lums)", action_desc, (unsigned long)duration_ms);
@@ -568,43 +594,31 @@ setInterval(pollAllData, 8000);
 // extern esp_err_t microlink_http_index_handler(httpd_req_t *req);
 
 static void start_custom_web_server(void) {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.server_port = 80;
-    config.ctrl_port = 32768;
-    config.max_uri_handlers = 12; // 稍微提高 URI 處理器上限
-    config.stack_size = 8192; 
-    config.max_open_sockets = 7; 
-    config.backlog_conn = 5;     
-
-    ESP_LOGI(TAG, "Starting HTTP Server on port: '%d'", config.server_port);
-    if (httpd_start(&server_handle, &config) == ESP_OK) {
-        
-        /* 1. 根目錄 '/' 保留給 MicroLink 原本的功能/網頁 */
-        // 注意：請將 microlink_http_index_handler 替換為 microlink 範例中原本綁定在 "/" 的 handler 函式名稱
-        // httpd_uri_t uri_root = { .uri = "/", .method = HTTP_GET, .handler = microlink_http_index_handler };
-        // httpd_register_uri_handler(server_handle, &uri_root);
-
-        /* 2. 電腦電源控制面板頁面 (點擊 http://<IP>/power 進入) */
-        httpd_uri_t uri_power      = { .uri = "/power",        .method = HTTP_GET, .handler = index_html_handler };
-        
-        /* 3. 電源控制與狀態查詢 API */
-        httpd_uri_t uri_click      = { .uri = "/power/api",    .method = HTTP_GET, .handler = power_click_handler };
-        httpd_uri_t uri_hold       = { .uri = "/power/hold/api",.method = HTTP_GET, .handler = power_hold_handler };
-        httpd_uri_t uri_pc_status  = { .uri = "/api/pc_status", .method = HTTP_GET, .handler = pc_status_api_handler };
-        httpd_uri_t uri_sysinfo    = { .uri = "/api/sysinfo",   .method = HTTP_GET, .handler = sysinfo_api_handler };
-
-        httpd_register_uri_handler(server_handle, &uri_power);
-        httpd_register_uri_handler(server_handle, &uri_click);
-        httpd_register_uri_handler(server_handle, &uri_hold);
-        httpd_register_uri_handler(server_handle, &uri_pc_status);
-        httpd_register_uri_handler(server_handle, &uri_sysinfo);
-
-        ESP_LOGI(TAG, "✅ Custom HTTP Server started!");
-        ESP_LOGI(TAG, "   └─ MicroLink Dashboard: http://<IP>/");
-        ESP_LOGI(TAG, "   └─ PC Power Control   : http://<IP>/power");
-    } else {
-        ESP_LOGE(TAG, "❌ Failed to start custom HTTP Server!");
+    /* MicroLink's config httpd (ml_config_httpd_start, called from microlink_start())
+     * already owns port 80 and serves "/" plus the config API endpoints. Register
+     * our extra URIs on that same server instead of starting a second one - two
+     * httpd_start() calls on the same port fail the second time. */
+    server_handle = ml_config_httpd_get_handle();
+    if (!server_handle) {
+        ESP_LOGE(TAG, "Failed to attach custom HTTP handlers: MicroLink config httpd not running");
+        return;
     }
+
+    httpd_uri_t uri_power      = { .uri = "/power",        .method = HTTP_GET, .handler = index_html_handler };
+    httpd_uri_t uri_click      = { .uri = "/power/api",    .method = HTTP_GET, .handler = power_click_handler };
+    httpd_uri_t uri_hold       = { .uri = "/power/hold/api",.method = HTTP_GET, .handler = power_hold_handler };
+    httpd_uri_t uri_pc_status  = { .uri = "/api/pc_status", .method = HTTP_GET, .handler = pc_status_api_handler };
+    httpd_uri_t uri_sysinfo    = { .uri = "/api/sysinfo",   .method = HTTP_GET, .handler = sysinfo_api_handler };
+
+    httpd_register_uri_handler(server_handle, &uri_power);
+    httpd_register_uri_handler(server_handle, &uri_click);
+    httpd_register_uri_handler(server_handle, &uri_hold);
+    httpd_register_uri_handler(server_handle, &uri_pc_status);
+    httpd_register_uri_handler(server_handle, &uri_sysinfo);
+
+    ESP_LOGI(TAG, "Custom HTTP handlers attached to MicroLink config server!");
+    ESP_LOGI(TAG, "   - MicroLink Dashboard: http://<IP>/");
+    ESP_LOGI(TAG, "   - PC Power Control   : http://<IP>/power");
 }
 
 static void turn_off_board_rgb(void) {
@@ -617,20 +631,87 @@ static void turn_off_board_rgb(void) {
  * WiFi Init
  * ========================================================================== */
 
+static void wifi_creds_init(void) {
+    g_wifi_count = 0;
+
+    /* 1. Firmware-baked defaults — always tried first, highest priority. */
+    for (int i = 0; i < WIFI_DEFAULT_COUNT; i++) {
+        wifi_cred_t *slot = &g_wifi_creds[g_wifi_count];
+        strncpy(slot->ssid, k_default_wifi_creds[i].ssid, sizeof(slot->ssid) - 1);
+        strncpy(slot->password, k_default_wifi_creds[i].password, sizeof(slot->password) - 1);
+        g_wifi_count++;
+    }
+
+    /* 2. Web UI / NVS list — lower priority, user-editable, appended after. */
+    ml_config_wifi_list_t nvs_list;
+    if (ml_config_get_wifi_list(&nvs_list)) {
+        for (int i = 0; i < nvs_list.count && g_wifi_count < WIFI_MAX_NETWORKS; i++) {
+            if (nvs_list.entries[i].ssid[0] == '\0') {
+                continue;
+            }
+            wifi_cred_t *slot = &g_wifi_creds[g_wifi_count];
+            strncpy(slot->ssid, nvs_list.entries[i].ssid, sizeof(slot->ssid) - 1);
+            strncpy(slot->password, nvs_list.entries[i].pass, sizeof(slot->password) - 1);
+            g_wifi_count++;
+        }
+    }
+
+    ESP_LOGI(TAG, "WiFi: %d network(s) configured (%d built-in default + %d from web UI)",
+             (int)g_wifi_count, WIFI_DEFAULT_COUNT, (int)g_wifi_count - WIFI_DEFAULT_COUNT);
+}
+
+static void wifi_set_config(size_t idx) {
+    if (g_wifi_count == 0) {
+        return;
+    }
+    idx %= g_wifi_count;
+
+    wifi_config_t wifi_config = {
+        .sta = { .threshold.authmode = WIFI_AUTH_WPA2_PSK },
+    };
+    strncpy((char *)wifi_config.sta.ssid, g_wifi_creds[idx].ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.password, g_wifi_creds[idx].password, sizeof(wifi_config.sta.password) - 1);
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_LOGI(TAG, "WiFi: trying \"%s\" (%d/%d)", g_wifi_creds[idx].ssid, (int)idx + 1, (int)g_wifi_count);
+}
+
+static void wifi_try_next(void) {
+    if (g_wifi_count == 0) {
+        ESP_LOGE(TAG, "WiFi: no networks configured, cannot connect");
+        return;
+    }
+    wifi_set_config(g_wifi_next_idx);
+    esp_wifi_connect();
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        wifi_try_next();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "Wi-Fi disconnected, reconnecting...");
-        esp_wifi_connect();
+        wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGW(TAG, "Wi-Fi disconnected (reason=%d), cycling to next network in list...", disc ? disc->reason : -1);
+        if (g_wifi_count > 0) {
+            g_wifi_next_idx = (g_wifi_next_idx + 1) % g_wifi_count;
+        }
+        wifi_try_next();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+
+        if (g_ml_started && ml) {
+            ESP_LOGI(TAG, "Wi-Fi (re)connected — rebinding MicroLink/Tailscale");
+            esp_err_t rb_err = microlink_rebind(ml);
+            if (rb_err != ESP_OK) {
+                ESP_LOGE(TAG, "microlink_rebind failed: %s", esp_err_to_name(rb_err));
+            }
+        }
     }
 }
 
 static void wifi_init(void) {
+    wifi_creds_init();
+
     wifi_event_group = xEventGroupCreate();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -642,14 +723,8 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
-    wifi_config_t wifi_config = {
-        .sta = { .threshold.authmode = WIFI_AUTH_WPA2_PSK },
-    };
-    strncpy((char *)wifi_config.sta.ssid, wifi_ssid, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char *)wifi_config.sta.password, wifi_password, sizeof(wifi_config.sta.password) - 1);
-
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    wifi_set_config(g_wifi_next_idx);
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 }
@@ -676,8 +751,6 @@ void app_main(void) {
 
     xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
 
-    start_custom_web_server();
-
     microlink_config_t config = {
         .auth_key = CONFIG_ML_TAILSCALE_AUTH_KEY,
         .device_name = CONFIG_ML_DEVICE_NAME,
@@ -694,7 +767,22 @@ void app_main(void) {
         return;
     }
 
+    {
+        char ssids[WIFI_DEFAULT_COUNT][33];
+        char passwords[WIFI_DEFAULT_COUNT][65];
+        for (int i = 0; i < WIFI_DEFAULT_COUNT; i++) {
+            strncpy(ssids[i], k_default_wifi_creds[i].ssid, sizeof(ssids[i]) - 1);
+            ssids[i][sizeof(ssids[i]) - 1] = '\0';
+            strncpy(passwords[i], k_default_wifi_creds[i].password, sizeof(passwords[i]) - 1);
+            passwords[i][sizeof(passwords[i]) - 1] = '\0';
+        }
+        microlink_set_default_wifi_list(ml, ssids, passwords, WIFI_DEFAULT_COUNT);
+    }
+
     ESP_ERROR_CHECK(microlink_start(ml));
+    g_ml_started = true;
+
+    start_custom_web_server();
 
     // 優化：將 API Task 優先級降為 2 (避免搶占 HTTPd 5 與其他即時 Task)
     xTaskCreate(fetch_tailscale_devices_task, "ts_api_task", 8192, NULL, 2, NULL);

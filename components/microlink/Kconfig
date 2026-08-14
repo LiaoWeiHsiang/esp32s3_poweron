@@ -269,6 +269,9 @@ menu "MicroLink V2 Configuration"
                 Password for the WiFi network.
                 This is stored in sdkconfig which should be git-ignored.
 
+        comment "Additional networks: use the config web UI (or NVS) WiFi list —"
+        comment "the app tries the firmware-baked defaults first, then that list."
+
         config ML_TAILSCALE_AUTH_KEY
             string "Tailscale Auth Key"
             default ""
@@ -276,6 +279,14 @@ menu "MicroLink V2 Configuration"
                 Tailscale authentication key from https://login.tailscale.com/admin/settings/keys
                 Generate a reusable + ephemeral key for development.
                 This is stored in sdkconfig which should be git-ignored.
+
+        config ML_TAILSCALE_API_KEY
+            string "Tailscale API Key (basic_connect dashboard)"
+            default ""
+            help
+                Tailscale API key used by the basic_connect dashboard to query
+                the device list. Store it in the git-ignored sdkconfig or
+                sdkconfig.credentials; never put it in source code.
 
         config ML_DEVICE_NAME
             string "Device Name"

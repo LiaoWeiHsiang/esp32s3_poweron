@@ -28,7 +28,7 @@ CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096
 
 CONFIG_ML_WIFI_SSID="EnglishTsai"
 CONFIG_ML_WIFI_PASSWORD="22222222"
-CONFIG_ML_TAILSCALE_AUTH_KEY="tskey-auth-kjKvBVX8eH11CNTRL-S5rfL9FNQq6EDo8wa8DMr6xiSnu9V5Wq3"
+# Set CONFIG_ML_TAILSCALE_AUTH_KEY in the local git-ignored sdkconfig.credentials file.
 CONFIG_ML_DEVICE_NAME="esp32s3-power-switch"
 
 # WiFi — low-latency tuning for WireGuard traffic

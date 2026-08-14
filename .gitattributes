@@ -1,0 +1,18 @@
+# Normalize to LF in the repository; check out native line endings by default.
+* text=auto
+
+# Must stay LF even on Windows checkouts.
+*.sh      text eol=lf
+*.s       text eol=lf
+*.S       text eol=lf
+Makefile  text eol=lf
+
+# Must stay CRLF so cmd.exe parses labels/goto correctly.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Never touch binaries.
+*.bin  binary
+*.png  binary
+*.jpg  binary
+*.elf  binary
