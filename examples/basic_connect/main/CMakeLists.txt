@@ -10,6 +10,8 @@ idf_component_register(
         esp_http_client 
         esp-tls
         json 
-        esp_http_server 
+        esp_http_server
         driver
+        esp_adc
+        esp_driver_rmt
 )

@@ -208,15 +208,31 @@ microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
     return sock;
 }
 
+/* Overall wall-clock budget for one microlink_tcp_send() call. SO_SNDTIMEO
+ * bounds each individual send() syscall, but EAGAIN/EWOULDBLOCK and a real
+ * per-call timeout look identical to the caller — this loop used to retry
+ * either one forever. A tunnel that goes black-holed (e.g. right after a
+ * network switch) would then hang the calling task permanently even though
+ * a send timeout was explicitly configured at connect time. */
+#define ML_TCP_SEND_MAX_MS  30000
+
 esp_err_t microlink_tcp_send(microlink_tcp_socket_t *sock, const void *data, size_t len) {
     if (!sock || !sock->connected || sock->fd < 0) return ESP_ERR_INVALID_STATE;
     if (!data || len == 0) return ESP_ERR_INVALID_ARG;
+
+    int64_t deadline_us = esp_timer_get_time() + (int64_t)ML_TCP_SEND_MAX_MS * 1000;
 
     size_t sent = 0;
     while (sent < len) {
         int n = send(sock->fd, (const uint8_t *)data + sent, len - sent, 0);
         if (n <= 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (esp_timer_get_time() >= deadline_us) {
+                    ESP_LOGE(TAG, "TCP send timed out after %dms (sent %d/%d)",
+                             ML_TCP_SEND_MAX_MS, (int)sent, (int)len);
+                    sock->connected = false;
+                    return ESP_ERR_TIMEOUT;
+                }
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }

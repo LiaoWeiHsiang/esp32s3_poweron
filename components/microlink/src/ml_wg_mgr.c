@@ -207,6 +207,8 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
     ip4_addr_set_u32(ip_2_ip4(&dst), dest_ip);  /* already network byte order */
 
     err_t err = udp_sendto(s_wg_output_pcb, p, &dst, dest_port);
+    /* udp_sendto() never takes ownership of our pbuf (success or failure) —
+     * caller must always free its own reference. */
     pbuf_free(p);
     return err;
 }
@@ -1144,6 +1146,44 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
  * WireGuard Packet Processing
  * ========================================================================== */
 
+typedef struct {
+    void *device;
+    struct pbuf *p;
+    ip_addr_t addr;
+    u16_t port;
+} wg_rx_ctx_t;
+
+/* Bounds how many wg_rx_ctx_t allocations can be queued into tcpip_thread's
+ * mailbox and not yet processed. Without this, a packet burst arriving
+ * faster than tcpip_thread drains them (heavy load, or churn during a
+ * rebind) mallocs one context per packet with nothing capping how many pile
+ * up — unbounded heap growth under exactly the conditions most likely to
+ * cause it. ML_WG_RX_QUEUE_DEPTH (8) is the depth of the FreeRTOS queue this
+ * data arrived through; double it for headroom since tcpip_thread should
+ * normally drain faster than that queue fills. */
+#define ML_WG_RX_INFLIGHT_MAX  (ML_WG_RX_QUEUE_DEPTH * 2)
+static volatile int32_t s_wg_rx_inflight = 0;
+
+static void wg_rx_tcpip_call(void *arg) {
+    wg_rx_ctx_t *ctx = (wg_rx_ctx_t *)arg;
+    if (!ctx || !ctx->device || !ctx->p) {
+        if (ctx && ctx->p) {
+            pbuf_free(ctx->p);
+        }
+        free(ctx);
+        __atomic_fetch_sub(&s_wg_rx_inflight, 1, __ATOMIC_RELAXED);
+        return;
+    }
+
+    /* IMPORTANT: This runs in the tcpip_thread context, which is the only
+     * thread allowed to invoke lwIP TCP/IP state transitions.
+     * Doing this directly from ml_wg_mgr_task caused cross-thread access to
+     * TCP PCB state, which led to the observed tcp_input/tcp_output crash. */
+    wireguardif_network_rx(ctx->device, NULL, ctx->p, &ctx->addr, ctx->port);
+    free(ctx);
+    __atomic_fetch_sub(&s_wg_rx_inflight, 1, __ATOMIC_RELAXED);
+}
+
 static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
     ESP_LOGI(TAG, "WG RX: %d bytes, via_derp=%d, type=%d, from=%02x%02x%02x%02x",
              (int)pkt->len, pkt->via_derp,
@@ -1163,7 +1203,7 @@ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
 
     /* Allocate PBUF_RAM and copy data so the pbuf OWNS its data.
      * This is required because wireguardif decrypts in-place and then
-     * calls ip_input → tcpip_input which posts to the TCPIP thread.
+     * calls ip_input → tcpip_input which must run on the tcpip thread.
      * With PBUF_REF the backing data would be freed before the TCPIP
      * thread processes the packet. */
     struct pbuf *p = pbuf_alloc(PBUF_RAW, pkt->len, PBUF_RAM);
@@ -1183,8 +1223,36 @@ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
         ip4_addr_set_u32(ip_2_ip4(&addr), htonl(pkt->src_ip));
     }
 
-    /* Call WG RX handler — pbuf is PBUF_RAM so data survives async delivery */
-    wireguardif_network_rx(device, NULL, p, &addr, pkt->src_port);
+    if (__atomic_load_n(&s_wg_rx_inflight, __ATOMIC_RELAXED) >= ML_WG_RX_INFLIGHT_MAX) {
+        /* tcpip_thread is behind — drop rather than pile up another malloc.
+         * WireGuard/DISCO retry, so losing a packet here just costs a retry
+         * instead of unbounded heap growth. */
+        ESP_LOGW(TAG, "WG RX backpressure: %d in flight, dropping packet", ML_WG_RX_INFLIGHT_MAX);
+        pbuf_free(p);
+        return;
+    }
+
+    wg_rx_ctx_t *ctx = malloc(sizeof(wg_rx_ctx_t));
+    if (!ctx) {
+        pbuf_free(p);
+        return;
+    }
+
+    ctx->device = device;
+    ctx->p = p;
+    ctx->addr = addr;
+    ctx->port = pkt->src_port;
+
+    /* Do not call lwIP TCP/IP functions from ml_wg_mgr_task. Marshal to the
+     * tcpip_thread so all TCP PCB accesses are serialized. */
+    __atomic_fetch_add(&s_wg_rx_inflight, 1, __ATOMIC_RELAXED);
+    err_t err = tcpip_callback(wg_rx_tcpip_call, ctx);
+    if (err != ERR_OK) {
+        ESP_LOGE(TAG, "tcpip_callback failed: %d, dropping WG packet", err);
+        pbuf_free(ctx->p);
+        free(ctx);
+        __atomic_fetch_sub(&s_wg_rx_inflight, 1, __ATOMIC_RELAXED);
+    }
 }
 
 /* ============================================================================

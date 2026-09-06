@@ -64,22 +64,28 @@ static int write_frame_header(uint8_t *out, uint32_t length, uint8_t type,
  * HPACK Encoding (minimal, sufficient for Tailscale)
  * ========================================================================== */
 
-/* HPACK indexed header field (RFC 7541 Section 6.1) */
-static int hpack_indexed(uint8_t *out, int index) {
+/* HPACK indexed header field (RFC 7541 Section 6.1)
+ * All hpack_* helpers take max_len (remaining space in the caller's buffer)
+ * and check it BEFORE writing, returning -1 if the field wouldn't fit. */
+static int hpack_indexed(uint8_t *out, size_t max_len, int index) {
+    if (max_len < 1) return -1;
     /* Indexed Header Field: 1-bit prefix = 1 */
     out[0] = 0x80 | (index & 0x7F);
     return 1;
 }
 
 /* HPACK literal header with indexing (RFC 7541 Section 6.2.1) */
-static int hpack_literal_indexed(uint8_t *out, int name_index,
+static int hpack_literal_indexed(uint8_t *out, size_t max_len, int name_index,
                                    const char *value) {
+    size_t vlen = strlen(value);
+    /* Length prefix is a single byte (huffman=0), so cap at 255. */
+    if (vlen > 0xFF || max_len < 2 + vlen) return -1;
+
     int pos = 0;
     /* 6-bit prefix, bit pattern 01 */
     out[pos++] = 0x40 | (name_index & 0x3F);
 
     /* Value string (huffman=0) */
-    size_t vlen = strlen(value);
     out[pos++] = (uint8_t)vlen;
     memcpy(out + pos, value, vlen);
     pos += vlen;
@@ -87,16 +93,18 @@ static int hpack_literal_indexed(uint8_t *out, int name_index,
 }
 
 /* HPACK literal header without indexing, new name */
-static int hpack_literal_new(uint8_t *out, const char *name, const char *value) {
+static int hpack_literal_new(uint8_t *out, size_t max_len, const char *name, const char *value) {
+    size_t nlen = strlen(name);
+    size_t vlen = strlen(value);
+    if (nlen > 0xFF || vlen > 0xFF || max_len < 3 + nlen + vlen) return -1;
+
     int pos = 0;
     out[pos++] = 0x00;  /* Literal without indexing, new name */
 
-    size_t nlen = strlen(name);
     out[pos++] = (uint8_t)nlen;
     memcpy(out + pos, name, nlen);
     pos += nlen;
 
-    size_t vlen = strlen(value);
     out[pos++] = (uint8_t)vlen;
     memcpy(out + pos, value, vlen);
     pos += vlen;
@@ -189,43 +197,50 @@ int ml_h2_build_headers_frame(uint8_t *out, size_t out_size,
                                 uint32_t stream_id, bool end_stream) {
     if (out_size < 128) return -1;
 
-    /* Build HPACK payload first, then prepend header */
+    /* Build HPACK payload first, then prepend header. Every hpack_* call is
+     * bounds-checked against the space actually left in `hpack` BEFORE it
+     * writes anything, and a -1 (wouldn't fit) aborts the whole frame
+     * instead of writing past the buffer. */
     uint8_t hpack[256];
     int hpack_len = 0;
+    int n;
+
+#define HPACK_APPEND(call) do { \
+        n = (call); \
+        if (n < 0) { ESP_LOGE(TAG, "HPACK field too large for buffer"); return -1; } \
+        hpack_len += n; \
+    } while (0)
 
     /* :method */
     if (strcmp(method, "POST") == 0) {
-        hpack_len += hpack_indexed(hpack + hpack_len, HPACK_METHOD_POST);
+        HPACK_APPEND(hpack_indexed(hpack + hpack_len, sizeof(hpack) - hpack_len, HPACK_METHOD_POST));
     } else if (strcmp(method, "GET") == 0) {
-        hpack_len += hpack_indexed(hpack + hpack_len, HPACK_METHOD_GET);
+        HPACK_APPEND(hpack_indexed(hpack + hpack_len, sizeof(hpack) - hpack_len, HPACK_METHOD_GET));
     } else {
-        hpack_len += hpack_literal_indexed(hpack + hpack_len, 2, method);
+        HPACK_APPEND(hpack_literal_indexed(hpack + hpack_len, sizeof(hpack) - hpack_len, 2, method));
     }
 
     /* :path */
     if (strcmp(path, "/") == 0) {
-        hpack_len += hpack_indexed(hpack + hpack_len, HPACK_PATH_SLASH);
+        HPACK_APPEND(hpack_indexed(hpack + hpack_len, sizeof(hpack) - hpack_len, HPACK_PATH_SLASH));
     } else {
-        hpack_len += hpack_literal_indexed(hpack + hpack_len, 4, path);
+        HPACK_APPEND(hpack_literal_indexed(hpack + hpack_len, sizeof(hpack) - hpack_len, 4, path));
     }
 
     /* :scheme = http (Noise over raw TCP, not TLS — must match v1's 0x86) */
-    hpack_len += hpack_indexed(hpack + hpack_len, HPACK_SCHEME_HTTP);
+    HPACK_APPEND(hpack_indexed(hpack + hpack_len, sizeof(hpack) - hpack_len, HPACK_SCHEME_HTTP));
 
     /* :authority */
     if (authority) {
-        hpack_len += hpack_literal_indexed(hpack + hpack_len, HPACK_AUTHORITY, authority);
+        HPACK_APPEND(hpack_literal_indexed(hpack + hpack_len, sizeof(hpack) - hpack_len, HPACK_AUTHORITY, authority));
     }
 
     /* content-type */
     if (content_type) {
-        hpack_len += hpack_literal_indexed(hpack + hpack_len, HPACK_CONTENT_TYPE, content_type);
+        HPACK_APPEND(hpack_literal_indexed(hpack + hpack_len, sizeof(hpack) - hpack_len, HPACK_CONTENT_TYPE, content_type));
     }
 
-    if (hpack_len > 256) {
-        ESP_LOGE(TAG, "HPACK too large: %d", hpack_len);
-        return -1;
-    }
+#undef HPACK_APPEND
 
     /* Write frame header */
     uint8_t flags = H2_FLAG_END_HEADERS;
@@ -250,7 +265,9 @@ int ml_h2_build_headers_frame(uint8_t *out, size_t out_size,
 int ml_h2_build_data_frame(uint8_t *out, size_t out_size,
                              const uint8_t *data, size_t data_len,
                              uint32_t stream_id, bool end_stream) {
-    if (out_size < 9 + data_len) return -1;
+    /* Compare this way (not `out_size < 9 + data_len`) so a huge data_len
+     * can't wrap the addition and slip past the bound check. */
+    if (out_size < 9 || data_len > out_size - 9) return -1;
 
     uint8_t flags = end_stream ? H2_FLAG_END_STREAM : 0;
     int pos = write_frame_header(out, data_len, H2_FRAME_DATA, flags, stream_id);

@@ -68,6 +68,11 @@ static struct {
     volatile bool ppp_running;
     esp_event_handler_instance_t ip_event_handler;
     esp_event_handler_instance_t ppp_status_handler;
+    /* Set when ml_cellular_ppp_stop() times out waiting for PPPERR_USER.
+     * The netif/handlers/event-group are NOT destroyed at that point —
+     * ppp_status_event_handler() finishes the teardown itself, whenever
+     * PPPERR_USER actually arrives, however late. */
+    volatile bool ppp_teardown_pending;
 } s_cell = {
     .state = ML_CELL_STATE_OFF,
     .data_mode = ML_DATA_MODE_NONE,
@@ -468,6 +473,28 @@ static void ppp_status_event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "PPP closed (user interrupt)");
         if (s_cell.ppp_events) {
             xEventGroupSetBits(s_cell.ppp_events, PPP_CLOSED_BIT);
+        }
+        if (s_cell.ppp_teardown_pending) {
+            /* ml_cellular_ppp_stop() already gave up waiting and returned;
+             * finish the teardown it deferred, now that it's actually safe. */
+            ESP_LOGI(TAG, "Late PPP close confirmed — completing deferred teardown");
+            s_cell.ppp_teardown_pending = false;
+            if (s_cell.ppp_status_handler) {
+                esp_event_handler_instance_unregister(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, s_cell.ppp_status_handler);
+                s_cell.ppp_status_handler = NULL;
+            }
+            if (s_cell.ip_event_handler) {
+                esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID, s_cell.ip_event_handler);
+                s_cell.ip_event_handler = NULL;
+            }
+            if (s_cell.ppp_netif) {
+                esp_netif_destroy(s_cell.ppp_netif);
+                s_cell.ppp_netif = NULL;
+            }
+            if (s_cell.ppp_events) {
+                vEventGroupDelete(s_cell.ppp_events);
+                s_cell.ppp_events = NULL;
+            }
         }
     } else if (event_id == NETIF_PPP_ERRORAUTHFAIL) {
         ESP_LOGW(TAG, "PPP CHAP authentication failed — will fall back to AT");
@@ -932,6 +959,13 @@ esp_err_t ml_cellular_ppp_start(void)
         ESP_LOGE(TAG, "Cannot start PPP: not registered (state=%d)", s_cell.state);
         return ESP_ERR_INVALID_STATE;
     }
+    if (s_cell.ppp_teardown_pending) {
+        /* Previous PPP instance's netif/event-group are still owned by a
+         * deferred teardown (see ml_cellular_ppp_stop()) — reusing them
+         * for a new session would race the late close callback. */
+        ESP_LOGE(TAG, "Cannot start PPP: previous session's teardown still pending");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     return ppp_setup_and_dial();
 }
@@ -974,7 +1008,18 @@ esp_err_t ml_cellular_ppp_stop(void)
             if (bits & PPP_CLOSED_BIT) {
                 ESP_LOGI(TAG, "PPP close confirmed");
             } else {
-                ESP_LOGW(TAG, "PPP close timeout — proceeding with teardown");
+                /* DO NOT destroy the netif/handlers/event-group here — the
+                 * TCPIP thread's LCP terminate FSM may still be running and
+                 * will reference this memory. Leave everything alive and
+                 * let ppp_status_event_handler() finish the teardown itself
+                 * whenever PPPERR_USER actually arrives (see that handler's
+                 * ppp_teardown_pending branch). A stuck netif is a bounded,
+                 * known leak until then — a crash is not. */
+                ESP_LOGW(TAG, "PPP close timeout — deferring teardown to late callback");
+                s_cell.ppp_teardown_pending = true;
+                s_cell.info.data_connected = false;
+                s_cell.state = s_cell.info.registered ? ML_CELL_STATE_REGISTERED : ML_CELL_STATE_AT_OK;
+                return ESP_ERR_TIMEOUT;
             }
         }
         vTaskDelay(pdMS_TO_TICKS(100)); /* Brief settle after close */

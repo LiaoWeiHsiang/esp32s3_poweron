@@ -164,6 +164,14 @@ typedef struct {
     ml_zc_tx_ctx_t tx_pool[ML_ZC_TX_POOL_SIZE];
     volatile uint8_t tx_head;       /* Written by wg_mgr task */
     volatile uint8_t tx_tail;       /* Written by tcpip_thread */
+
+    /* Guards the "pcb is valid + claim a tx slot" decision in
+     * ml_zerocopy_send() against ml_zerocopy_deinit() tearing the PCB down
+     * concurrently (e.g. during microlink_rebind() from a different task).
+     * Held only for the few instructions that check `closing`/`pcb` and bump
+     * tx_head — never across the tcpip_callback() call itself. */
+    portMUX_TYPE tx_lock;
+    volatile bool closing;          /* Set under tx_lock by deinit() */
 } ml_zerocopy_t;
 
 #endif /* CONFIG_ML_ZERO_COPY_WG */
@@ -328,6 +336,13 @@ typedef struct {
     mbedtls_ctr_drbg_context ctr_drbg;
     bool connected;
     uint64_t last_recv_ms;          /* For keepalive watchdog */
+    /* Index into derp_regions[home_region].nodes[] of the node we last
+     * successfully connected to, or -1 if we've never connected. Reconnects
+     * (e.g. after microlink_rebind()) try this node FIRST instead of always
+     * restarting the node scan from index 0 — otherwise a rebind can land on
+     * a different DERP node within the same region than peers still expect,
+     * extending the outage window beyond what's necessary. */
+    int8_t last_good_node_idx;
 } ml_derp_conn_t;
 
 /* ============================================================================
@@ -384,9 +399,16 @@ struct microlink_s {
     /* WireGuard netif (owned exclusively by wg_mgr task) */
     void *wg_netif;
 
-    /* Peers (owned exclusively by wg_mgr task) */
+    /* Peers (owned exclusively by wg_mgr task, which accesses them directly
+     * without taking peers_lock — it's the single writer/reader of its own
+     * hot path). peers_lock exists for the occasional cross-task touch
+     * points: microlink_rebind() clearing stale direct-path state, the
+     * microlink_send()/resolve()/get_peer_info() public API, and the config
+     * httpd's GET /api/peers — all of which previously read/wrote this array
+     * from a different task with no synchronization at all. */
     ml_peer_t peers[ML_MAX_PEERS];
     int peer_count;
+    SemaphoreHandle_t peers_lock;
 
     /* STUN results (written by coord, read by coord only) */
     uint32_t stun_public_ip;

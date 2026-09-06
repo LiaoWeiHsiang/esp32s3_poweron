@@ -83,7 +83,7 @@ struct ml_config_ctx {
  * NVS Load/Save
  * ========================================================================== */
 
-static void config_save_peers(ml_config_ctx_t *ctx);  /* forward decl for migration */
+static esp_err_t config_save_peers(ml_config_ctx_t *ctx);  /* forward decl for migration */
 
 static void config_load_settings(ml_config_ctx_t *ctx) {
     /* Read whatever size blob exists — v1 blobs are smaller than v2 struct */
@@ -137,15 +137,18 @@ static void config_load_settings(ml_config_ctx_t *ctx) {
              strlen(CONFIG_ML_PRIORITY_PEER_IP) > 0 ? CONFIG_ML_PRIORITY_PEER_IP : "(none)");
 }
 
-static void config_save_settings(ml_config_ctx_t *ctx) {
+static esp_err_t config_save_settings(ml_config_ctx_t *ctx) {
     esp_err_t err = nvs_set_blob(ctx->nvs, NVS_KEY_SETTINGS, &ctx->settings,
                                   sizeof(ml_config_settings_t));
     if (err == ESP_OK) {
-        nvs_commit(ctx->nvs);
+        err = nvs_commit(ctx->nvs);
+    }
+    if (err == ESP_OK) {
         ESP_LOGI(TAG, "Settings saved to NVS");
     } else {
         ESP_LOGE(TAG, "Failed to save settings: %s", esp_err_to_name(err));
     }
+    return err;
 }
 
 static void config_load_peers(ml_config_ctx_t *ctx) {
@@ -157,8 +160,12 @@ static void config_load_peers(ml_config_ctx_t *ctx) {
         /* Old format used uint8_t count (1 byte), new format uses uint16_t (2 bytes).
          * Detect old format by checking if stored size matches old layout:
          * old = 1 + 28*N, new = 2 + 28*N. If (stored_len - 1) % 28 == 0 and
-         * (stored_len - 2) % 28 != 0, it's the old format. */
-        bool is_old_format = (stored_len >= 1) &&
+         * (stored_len - 2) % 28 != 0, it's the old format.
+         * stored_len is size_t (unsigned): require >= 2 up front so
+         * `stored_len - 2` below can't underflow into a huge number for a
+         * 1-byte (or empty) blob and make a corrupted/truncated blob look
+         * like a valid old-format one. */
+        bool is_old_format = (stored_len >= 2) &&
                              ((stored_len - 1) % sizeof(ml_config_peer_entry_t) == 0) &&
                              ((stored_len - 2) % sizeof(ml_config_peer_entry_t) != 0);
 
@@ -171,6 +178,12 @@ static void config_load_peers(ml_config_ctx_t *ctx) {
                 if (err == ESP_OK) {
                     uint8_t old_count = tmp[0];
                     uint16_t count = (old_count <= ML_CONFIG_MAX_ALLOWED_PEERS) ? old_count : 0;
+                    /* Belt-and-suspenders: don't trust old_count alone — cap
+                     * it against what tmp[] actually has room for (rlen - 1
+                     * bytes past the count byte), regardless of how the
+                     * format-detection heuristic above classified this blob. */
+                    size_t max_count_for_len = (rlen >= 1) ? (rlen - 1) / sizeof(ml_config_peer_entry_t) : 0;
+                    if (count > max_count_for_len) count = (uint16_t)max_count_for_len;
                     memset(&ctx->peer_list, 0, sizeof(ctx->peer_list));
                     ctx->peer_list.count = count;
                     if (count > 0) {
@@ -205,18 +218,21 @@ static void config_load_peers(ml_config_ctx_t *ctx) {
     }
 }
 
-static void config_save_peers(ml_config_ctx_t *ctx) {
+static esp_err_t config_save_peers(ml_config_ctx_t *ctx) {
     /* Only write count + actual entries (not the full 512-entry array) to save NVS space.
      * This reduces blob from ~14KB to just count*28+2 bytes. */
     size_t save_len = sizeof(ctx->peer_list.count) +
                       ctx->peer_list.count * sizeof(ml_config_peer_entry_t);
     esp_err_t err = nvs_set_blob(ctx->nvs, NVS_KEY_PEERS, &ctx->peer_list, save_len);
     if (err == ESP_OK) {
-        nvs_commit(ctx->nvs);
+        err = nvs_commit(ctx->nvs);
+    }
+    if (err == ESP_OK) {
         ESP_LOGI(TAG, "Peer allowlist saved (%d peers, %d bytes)", ctx->peer_list.count, (int)save_len);
     } else {
         ESP_LOGE(TAG, "Failed to save peers (%d bytes): %s", (int)save_len, esp_err_to_name(err));
     }
+    return err;
 }
 
 /* ============================================================================
@@ -252,18 +268,21 @@ static void config_load_wifi_list(ml_config_ctx_t *ctx) {
     }
 }
 
-static void config_save_wifi_list(ml_config_ctx_t *ctx) {
+static esp_err_t config_save_wifi_list(ml_config_ctx_t *ctx) {
     /* Variable-size save: header (2 bytes) + count * entry_size */
     size_t save_len = 2 + ctx->wifi_list.count * sizeof(ml_config_wifi_entry_t);
     esp_err_t err = nvs_set_blob(ctx->nvs, NVS_KEY_WIFI, &ctx->wifi_list, save_len);
     if (err == ESP_OK) {
-        nvs_commit(ctx->nvs);
+        err = nvs_commit(ctx->nvs);
+    }
+    if (err == ESP_OK) {
         ESP_LOGI(TAG, "WiFi list saved (%d entries, %d bytes)",
                  ctx->wifi_list.count, (int)save_len);
     } else {
         ESP_LOGE(TAG, "Failed to save WiFi list (%d bytes): %s",
                  (int)save_len, esp_err_to_name(err));
     }
+    return err;
 }
 
 /* ============================================================================
@@ -362,19 +381,41 @@ static esp_err_t send_json(httpd_req_t *req, cJSON *json) {
     return ESP_OK;
 }
 
-/* Helper: read POST body into buffer */
+/* Helper: read POST body into buffer.
+ * Bounded two ways: a fixed 4KB size cap (below), and an overall 10s wall-
+ * clock deadline across the whole read. httpd_req_recv()'s own timeout only
+ * bounds a single call — a client that declares Content-Length: 4096 and
+ * trickles it in a few bytes at a time (accidentally or otherwise) could
+ * keep this loop, and therefore esp_http_server's single request-processing
+ * task, busy indefinitely, starving every other tailnet device's requests
+ * to the config API. */
+#define ML_HTTPD_BODY_MAX_BYTES     4096
+#define ML_HTTPD_BODY_MAX_MS        10000
+
 static char *read_post_body(httpd_req_t *req) {
-    int content_len = req->content_len;
-    if (content_len <= 0 || content_len > 4096) {
+    /* Compare directly against the (unsigned) field instead of assigning to
+     * a signed int first — content_len is size_t, and a value that
+     * overflowed int would otherwise wrap into looking like a small/negative
+     * number before this bound ever gets to check it. */
+    if (req->content_len == 0 || req->content_len > ML_HTTPD_BODY_MAX_BYTES) {
         return NULL;
     }
+    size_t content_len = req->content_len;
+
     char *buf = malloc(content_len + 1);
     if (!buf) return NULL;
 
-    int received = 0;
+    int64_t deadline_ms = (int64_t)(esp_timer_get_time() / 1000) + ML_HTTPD_BODY_MAX_MS;
+    size_t received = 0;
     while (received < content_len) {
+        if ((int64_t)(esp_timer_get_time() / 1000) >= deadline_ms) {
+            ESP_LOGW(TAG, "POST body read timed out (%d/%d bytes)", (int)received, (int)content_len);
+            free(buf);
+            return NULL;
+        }
         int ret = httpd_req_recv(req, buf + received, content_len - received);
         if (ret <= 0) {
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT) continue; /* single-call timeout, overall deadline still governs */
             free(buf);
             return NULL;
         }
@@ -386,6 +427,7 @@ static char *read_post_body(httpd_req_t *req) {
 
 /* GET / — serve HTML config page */
 static esp_err_t handler_root(httpd_req_t *req) {
+    ESP_LOGI(TAG, "HTTP GET / from client");   /* 新增 */
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr(req, CONFIG_PAGE_HTML);
     return ESP_OK;
@@ -550,10 +592,13 @@ static esp_err_t handler_post_settings(httpd_req_t *req) {
     #undef COPY_STR_FIELD
     cJSON_Delete(json);
 
-    config_save_settings(ctx);
+    esp_err_t save_err = config_save_settings(ctx);
 
     cJSON *resp = cJSON_CreateObject();
-    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddBoolToObject(resp, "ok", save_err == ESP_OK);
+    if (save_err != ESP_OK) {
+        cJSON_AddStringToObject(resp, "error", "Failed to save to flash — settings not persisted");
+    }
     cJSON_AddBoolToObject(resp, "restart_required", true);
     return send_json(req, resp);
 }
@@ -664,13 +709,16 @@ static esp_err_t handler_post_allowed(httpd_req_t *req) {
     }
     cJSON_Delete(json);
 
-    config_save_peers(ctx);
+    esp_err_t save_err = config_save_peers(ctx);
 
     ESP_LOGI(TAG, "Allowlist updated: %d peers, filter %s",
              ctx->peer_list.count, ctx->filter_enabled ? "ON" : "OFF");
 
     cJSON *resp = cJSON_CreateObject();
-    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddBoolToObject(resp, "ok", save_err == ESP_OK);
+    if (save_err != ESP_OK) {
+        cJSON_AddStringToObject(resp, "error", "Failed to save to flash — allowlist not persisted");
+    }
     cJSON_AddNumberToObject(resp, "count", ctx->peer_list.count);
     cJSON_AddBoolToObject(resp, "filter_enabled", ctx->filter_enabled);
     return send_json(req, resp);
@@ -685,12 +733,15 @@ static esp_err_t handler_delete_allowed(httpd_req_t *req) {
         ctx->filter_enabled = false;
         xSemaphoreGive(ctx->peer_mutex);
     }
-    config_save_peers(ctx);
+    esp_err_t save_err = config_save_peers(ctx);
 
     ESP_LOGI(TAG, "Allowlist cleared, filter OFF (all peers allowed)");
 
     cJSON *resp = cJSON_CreateObject();
-    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddBoolToObject(resp, "ok", save_err == ESP_OK);
+    if (save_err != ESP_OK) {
+        cJSON_AddStringToObject(resp, "error", "Failed to save to flash — allowlist not persisted");
+    }
     cJSON_AddBoolToObject(resp, "filter_enabled", false);
     return send_json(req, resp);
 }
@@ -873,12 +924,23 @@ static esp_err_t handler_post_wifi(httpd_req_t *req) {
         if (pass && cJSON_IsString(pass)) {
             const char *pv = pass->valuestring;
             if (strcmp(pv, "********") == 0) {
-                /* Masked: find matching SSID in old list and copy password */
+                /* Masked: find matching SSID in old list and copy password.
+                 * Falls back to matching by array position if no SSID
+                 * matches — the web UI's edit flow (editWifi()) replaces an
+                 * entry in place at the same index, so renaming the SSID
+                 * while leaving the password field blank ("keep current")
+                 * would otherwise find no match here and silently save an
+                 * empty password for that network. */
+                bool found = false;
                 for (int j = 0; j < old_list.count; j++) {
                     if (strcmp(old_list.entries[j].ssid, e->ssid) == 0) {
                         strncpy(e->pass, old_list.entries[j].pass, sizeof(e->pass) - 1);
+                        found = true;
                         break;
                     }
+                }
+                if (!found && i < old_list.count) {
+                    strncpy(e->pass, old_list.entries[i].pass, sizeof(e->pass) - 1);
                 }
             } else if (pv[0] != '\0') {
                 strncpy(e->pass, pv, sizeof(e->pass) - 1);
@@ -889,6 +951,7 @@ static esp_err_t handler_post_wifi(httpd_req_t *req) {
     cJSON_Delete(json);
 
     /* Update settings blob wifi_ssid/wifi_pass with entry[0] for backwards compat */
+    esp_err_t save_err = ESP_OK;
     if (ctx->wifi_list.count > 0) {
         memset(ctx->settings.wifi_ssid, 0, sizeof(ctx->settings.wifi_ssid));
         memset(ctx->settings.wifi_pass, 0, sizeof(ctx->settings.wifi_pass));
@@ -896,15 +959,19 @@ static esp_err_t handler_post_wifi(httpd_req_t *req) {
                 sizeof(ctx->settings.wifi_ssid) - 1);
         strncpy(ctx->settings.wifi_pass, ctx->wifi_list.entries[0].pass,
                 sizeof(ctx->settings.wifi_pass) - 1);
-        config_save_settings(ctx);
+        save_err = config_save_settings(ctx);
     }
 
-    config_save_wifi_list(ctx);
+    esp_err_t wifi_save_err = config_save_wifi_list(ctx);
+    if (save_err == ESP_OK) save_err = wifi_save_err;
 
     ESP_LOGI(TAG, "WiFi list updated: %d networks", ctx->wifi_list.count);
 
     cJSON *resp = cJSON_CreateObject();
-    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddBoolToObject(resp, "ok", save_err == ESP_OK);
+    if (save_err != ESP_OK) {
+        cJSON_AddStringToObject(resp, "error", "Failed to save to flash — WiFi list not persisted");
+    }
     cJSON_AddNumberToObject(resp, "count", ctx->wifi_list.count);
     cJSON_AddBoolToObject(resp, "restart_required", true);
     return send_json(req, resp);
@@ -1127,12 +1194,22 @@ esp_err_t ml_config_httpd_start(ml_config_ctx_t *ctx, microlink_t *ml) {
     if (!ctx) return ESP_ERR_INVALID_ARG;
     ctx->ml = ml;
 
-    g_config_ctx = ctx; // <-- 新增這行：將 ctx 保存到全域指標
+    g_config_ctx = ctx;
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 6144;
-    config.max_uri_handlers = 20; /* 12 config-httpd URIs + 5 attached from main.c, plus headroom */
+    config.max_uri_handlers = 20;
     config.uri_match_fn = httpd_uri_match_wildcard;
+
+    /* max_open_sockets stays at the IDF default (7): microlink's own DISCO +
+     * STUNv4 + STUNv6 + coord TLS + DERP TLS sockets already hold ~5 of the
+     * CONFIG_LWIP_MAX_SOCKETS=16 budget, so raising this cuts into sockets
+     * the VPN tunnel itself needs. lru_purge_enable evicts the LRU client
+     * instead of silently dropping new connections when the pool is full. */
+    config.lru_purge_enable = true;
+    config.recv_wait_timeout = 5;
+    config.send_wait_timeout = 5;
+    config.backlog_conn = 5;
 
     esp_err_t err = httpd_start(&ctx->httpd, &config);
     if (err != ESP_OK) {

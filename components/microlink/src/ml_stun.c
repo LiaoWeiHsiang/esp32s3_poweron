@@ -55,6 +55,16 @@ static bool txid_v4_valid = false;
 static uint8_t txid_v6[12];
 static bool txid_v6_valid = false;
 
+/* Constant-time compare for the transaction ID — this is the only thing
+ * standing between a real STUN server response and a spoofed one forging
+ * our public endpoint, so it shouldn't leak byte-by-byte match progress
+ * through timing the way plain memcmp() can. */
+static bool txid_equal(const uint8_t *a, const uint8_t *b, size_t len) {
+    uint8_t diff = 0;
+    for (size_t i = 0; i < len; i++) diff |= a[i] ^ b[i];
+    return diff == 0;
+}
+
 /* ============================================================================
  * CRC32 FINGERPRINT (IEEE 802.3, matches Tailscale's crc32.ChecksumIEEE)
  * ========================================================================== */
@@ -375,7 +385,7 @@ bool ml_stun_parse_response(const uint8_t *data, size_t len,
     }
 
     /* Check txid against IPv4 txid (IPv6 responses use separate parser) */
-    if (txid_v4_valid && memcmp(data + 8, txid_v4, 12) != 0) {
+    if (txid_v4_valid && !txid_equal(data + 8, txid_v4, 12)) {
         /* Could be an IPv6 response arriving on IPv4 queue — don't warn */
         ESP_LOGD(TAG, "STUN IPv4 txid mismatch (may be IPv6 response)");
         return false;
@@ -536,8 +546,8 @@ bool ml_stun_parse_response_ipv6(const uint8_t *data, size_t len,
 
     /* Check txid against IPv6 txid first, then try IPv4 txid
      * (response may arrive on shared queue from either socket) */
-    bool matched_v6 = (txid_v6_valid && memcmp(data + 8, txid_v6, 12) == 0);
-    bool matched_v4 = (!matched_v6 && txid_v4_valid && memcmp(data + 8, txid_v4, 12) == 0);
+    bool matched_v6 = (txid_v6_valid && txid_equal(data + 8, txid_v6, 12));
+    bool matched_v4 = (!matched_v6 && txid_v4_valid && txid_equal(data + 8, txid_v4, 12));
     if (!matched_v6 && !matched_v4) return false;
 
     /* Use whichever txid matched for XOR decoding */

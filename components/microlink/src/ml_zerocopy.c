@@ -62,16 +62,25 @@ static void zc_pcb_recv_cb(void *arg, struct udp_pcb *pcb,
         return;
     }
 
-    uint8_t *data = (uint8_t *)p->payload;
     size_t len = p->tot_len;
 
+    /* Classification only ever looks at the first 8 bytes (STUN cookie) or
+     * first 6 (DISCO magic); copy just that much out via pbuf_copy_partial
+     * so a chained pbuf whose first segment is shorter than `len` can't be
+     * read past its own p->len. (The actual payload handling below still
+     * uses `p` itself via pbuf_copy_partial / wireguardif_network_rx, which
+     * both already walk the full chain correctly.) */
+    uint8_t hdr[8];
+    size_t hdr_len = len < sizeof(hdr) ? len : sizeof(hdr);
+    pbuf_copy_partial(p, hdr, hdr_len, 0);
+
     /* Classify packet */
-    bool is_disco = (len >= 62 && memcmp(data, DISCO_MAGIC, 6) == 0);
+    bool is_disco = (len >= 62 && hdr_len >= 6 && memcmp(hdr, DISCO_MAGIC, 6) == 0);
 
     bool is_stun = false;
-    if (!is_disco && len >= 20) {
-        uint32_t cookie = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) |
-                          ((uint32_t)data[6] << 8) | (uint32_t)data[7];
+    if (!is_disco && len >= 20 && hdr_len >= 8) {
+        uint32_t cookie = ((uint32_t)hdr[4] << 24) | ((uint32_t)hdr[5] << 16) |
+                          ((uint32_t)hdr[6] << 8) | (uint32_t)hdr[7];
         is_stun = (cookie == STUN_MAGIC_COOKIE);
     }
 
@@ -192,8 +201,24 @@ static void zc_pcb_remove_in_tcpip(void *arg) {
 esp_err_t ml_zerocopy_init(microlink_t *ml) {
     ESP_LOGI(TAG, "Initializing zero-copy WG path");
 
+    /* On a re-init (rebind), wg_mgr_task's drain loop may still be catching
+     * up on DISCO entries queued before the old PCB was removed. Give it a
+     * brief chance to empty the ring before we reset the indices under it —
+     * bounded, since nothing new can arrive once the old PCB is gone. */
+    int waited_ms = 0;
+    while (__atomic_load_n(&ml->zc.rx_head, __ATOMIC_ACQUIRE) !=
+           __atomic_load_n(&ml->zc.rx_tail, __ATOMIC_ACQUIRE)) {
+        vTaskDelay(pdMS_TO_TICKS(2));
+        waited_ms += 2;
+        if (waited_ms >= 100) break;
+    }
+
     /* Clear ring buffer state */
     memset(&ml->zc, 0, sizeof(ml->zc));
+    /* portMUX_TYPE's "unlocked" value is NOT all-zero bits (see spinlock.h) —
+     * must be set explicitly, the memset above does not make it valid. */
+    ml->zc.tx_lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
+    ml->zc.closing = false;
 
     /* Create PCB in tcpip_thread */
     zc_setup_ctx_t ctx = {
@@ -232,6 +257,28 @@ void ml_zerocopy_deinit(microlink_t *ml) {
 
     ESP_LOGI(TAG, "Shutting down zero-copy WG path");
 
+    /* 1. Block any new send from claiming a TX slot (see the matching
+     *    critical section in ml_zerocopy_send()). */
+    taskENTER_CRITICAL(&ml->zc.tx_lock);
+    ml->zc.closing = true;
+    taskEXIT_CRITICAL(&ml->zc.tx_lock);
+
+    /* 2. Drain: wait for every send that already claimed a slot (and so is
+     *    either about to run, or already queued, in tcpip_thread) to finish
+     *    executing zc_send_in_tcpip() and advance tx_tail. Once head==tail,
+     *    no callback anywhere still holds a reference to ml->zc.pcb. */
+    int waited_ms = 0;
+    while (__atomic_load_n(&ml->zc.tx_head, __ATOMIC_ACQUIRE) !=
+           __atomic_load_n(&ml->zc.tx_tail, __ATOMIC_ACQUIRE)) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+        waited_ms += 5;
+        if (waited_ms >= 2000) {
+            ESP_LOGW(TAG, "TX drain timed out after %dms — proceeding anyway", waited_ms);
+            break;
+        }
+    }
+
+    /* 3. Only now is it safe to actually free the PCB. */
     zc_setup_ctx_t ctx = {
         .ml = ml,
         .done = xSemaphoreCreateBinary(),
@@ -245,14 +292,27 @@ void ml_zerocopy_deinit(microlink_t *ml) {
 
 esp_err_t ml_zerocopy_send(microlink_t *ml, const uint8_t *data, size_t len,
                             uint32_t dest_ip, uint16_t dest_port) {
-    if (!ml->zc.pcb || len > ML_MAX_PACKET_SIZE) return ESP_ERR_INVALID_ARG;
+    if (len > ML_MAX_PACKET_SIZE) return ESP_ERR_INVALID_ARG;
 
-    /* Acquire TX pool slot (SPSC: wg_mgr writes head, tcpip reads tail) */
-    uint8_t head = __atomic_load_n(&ml->zc.tx_head, __ATOMIC_RELAXED);
+    /* Everything that decides "is the PCB still alive, may I claim a slot"
+     * happens under tx_lock, and ml_zerocopy_deinit() sets `closing` under
+     * the same lock before it starts tearing the PCB down. That makes the
+     * two mutually exclusive: either this send claims a slot before closing
+     * is set (deinit's drain below then waits for it to finish, so the PCB
+     * outlives it), or it sees closing==true and bails out before touching
+     * the PCB at all. Either way, a stale `ctx->pcb` can never reach
+     * zc_send_in_tcpip() after the PCB has been freed. */
+    taskENTER_CRITICAL(&ml->zc.tx_lock);
+    if (ml->zc.closing || !ml->zc.pcb) {
+        taskEXIT_CRITICAL(&ml->zc.tx_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t head = ml->zc.tx_head;
     uint8_t next = (head + 1) % ML_ZC_TX_POOL_SIZE;
     uint8_t tail = __atomic_load_n(&ml->zc.tx_tail, __ATOMIC_ACQUIRE);
-
     if (next == tail) {
+        taskEXIT_CRITICAL(&ml->zc.tx_lock);
         return ESP_ERR_NO_MEM;  /* TX pool full */
     }
 
@@ -265,6 +325,7 @@ esp_err_t ml_zerocopy_send(microlink_t *ml, const uint8_t *data, size_t len,
     ctx->port = dest_port;
 
     __atomic_store_n(&ml->zc.tx_head, next, __ATOMIC_RELEASE);
+    taskEXIT_CRITICAL(&ml->zc.tx_lock);
 
     /* Schedule send in tcpip_thread */
     tcpip_callback(zc_send_in_tcpip, ctx);
@@ -277,6 +338,8 @@ static void zc_send_in_tcpip(void *arg) {
     struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, ctx->len, PBUF_RAM);
     if (p) {
         memcpy(p->payload, ctx->data, ctx->len);
+        /* udp_sendto() never takes ownership of our pbuf (success or failure) —
+         * caller must always free its own reference. */
         udp_sendto(ctx->pcb, p, &ctx->dest, ctx->port);
         pbuf_free(p);
     }

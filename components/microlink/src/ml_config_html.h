@@ -27,6 +27,9 @@ static const char CONFIG_PAGE_HTML[] =
 ".conn-cell{background:#da363330;color:#f85149;border:1px solid #da3633}"
 ".hdr-ip{font-family:monospace;font-size:1em;color:#58a6ff;font-weight:600}"
 ".hdr-host{color:#8b949e;font-size:.85em}"
+".nav-link{color:#8b949e;font-size:.85em;text-decoration:none;padding:5px 12px;"
+"border:1px solid #30363d;border-radius:12px;transition:color .15s,border-color .15s}"
+".nav-link:hover{color:#58a6ff;border-color:#58a6ff}"
 
 /* Section cards */
 ".section{background:#161b22;border:1px solid #30363d;border-radius:8px;margin-bottom:16px;overflow:hidden}"
@@ -111,6 +114,7 @@ static const char CONFIG_PAGE_HTML[] =
 "<div><h1>MicroLink</h1>"
 "<span class='hdr-host' id='hostName'></span></div>"
 "<div class='hdr-right'>"
+"<a href='/power' class='nav-link'>&#9889; Power</a>"
 "<span class='conn-badge conn-wifi' id='connBadge'>WiFi</span>"
 "<span class='hdr-ip' id='vpnIp'>--</span>"
 "</div></div>"
@@ -125,6 +129,7 @@ static const char CONFIG_PAGE_HTML[] =
 "<div class='mon-grid'>"
 "<div class='mon-card'><div class='val' id='mTemp'>--</div><div class='lbl'>Temperature</div></div>"
 "<div class='mon-card'><div class='val' id='mRssi'>--</div><div class='lbl'>Signal</div></div>"
+"<div class='mon-card'><div class='val' id='mSsid'>--</div><div class='lbl'>WiFi SSID</div></div>"
 "<div class='mon-card'><div class='val' id='mUptime'>--</div><div class='lbl'>Uptime</div></div>"
 "<div class='mon-card'><div class='val' id='mHeap'>--</div><div class='lbl'>Free Heap</div></div>"
 "<div class='mon-card'><div class='val' id='mPsram'>--</div><div class='lbl'>Free PSRAM</div></div>"
@@ -141,7 +146,7 @@ static const char CONFIG_PAGE_HTML[] =
 "<span style='color:#8b949e;font-size:.75em'>priority order &mdash; restart required</span></div>"
 "<div class='section-body'>"
 "<p style='font-size:.8em;color:#8b949e;margin-bottom:10px'>"
-"Device tries each network in order until connected. Drag to reorder priority.</p>"
+"Device tries each network in order until connected. Use &uarr;/&darr; to reorder priority.</p>"
 "<div id='wifiDefaults'></div>"
 "<div id='wifiList'></div>"
 "<div class='add-form'>"
@@ -166,6 +171,17 @@ static const char CONFIG_PAGE_HTML[] =
 "<button class='btn-add btn-sm' onclick='addAllowed()'>Add</button>"
 "</div>"
 "<div class='msg' id='peersMsg'></div>"
+"</div></div>"
+
+/* ---- All Tailnet Peers Section ---- */
+"<div class='section'>"
+"<div class='section-hdr'><h2>All Tailnet Peers</h2>"
+"<span style='color:#8b949e;font-size:.75em' id='peersPageInfo'></span></div>"
+"<div class='section-body'>"
+"<input type='text' id='peerSearch' placeholder='Search by name or IP...' "
+"style='margin-bottom:10px' oninput='peersPage=0;renderAllPeers()'>"
+"<div id='allPeersList' class='peer-list'></div>"
+"<div class='add-form' id='peersPager' style='justify-content:center'></div>"
 "</div></div>"
 
 
@@ -239,12 +255,24 @@ static const char CONFIG_PAGE_HTML[] =
 "let allowedPeers=[];"
 "let wifiNetworks=[];"
 "let wifiDefaults=[];"
+"let allTailnetPeers=[];"
+"let peersPage=0;"
+"const PEERS_PER_PAGE=25;"
 
 "function showMsg(id,msg,ok){"
 "const el=document.getElementById(id);"
 "el.textContent=msg;"
 "el.className='msg '+(ok?'msg-ok':'msg-err');"
 "setTimeout(()=>{el.className='msg';},5000);"
+"}"
+
+/* Escape user-controlled text before it goes into innerHTML. SSID, peer
+ * labels/IPs and hostnames all ultimately come from other tailnet devices
+ * or this same open (no-auth) config API, so treat them as untrusted. */
+"function esc(s){"
+"var d=document.createElement('div');"
+"d.textContent=(s==null?'':String(s));"
+"return d.innerHTML;"
 "}"
 
 "function fmtUptime(s){"
@@ -274,6 +302,8 @@ static const char CONFIG_PAGE_HTML[] =
 "var sig='N/A';"
 "if(d.connection==='cellular'){sig='Cellular';}else if(d.rssi!=null){sig=d.rssi+' dBm';}"
 "document.getElementById('mRssi').textContent=sig;"
+"document.getElementById('mSsid').textContent="
+"d.connection==='cellular'?'N/A':(d.wifi_ssid||'--');"
 "document.getElementById('mUptime').textContent=fmtUptime(d.uptime_s);"
 "document.getElementById('mHeap').textContent=(d.free_heap/1024|0)+' KB';"
 "document.getElementById('mPsram').textContent=(d.free_psram/1024|0)+' KB';"
@@ -353,7 +383,8 @@ static const char CONFIG_PAGE_HTML[] =
 "try{"
 "const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});"
 "const d=await r.json();"
-"showMsg('settingsMsg','Saved. Restart device for changes to take effect.',true);"
+"if(d.ok)showMsg('settingsMsg','Saved. Restart device for changes to take effect.',true);"
+"else showMsg('settingsMsg',d.error||'Save failed',false);"
 "}catch(e){showMsg('settingsMsg','Save failed: '+e,false);}"
 "}"
 
@@ -374,8 +405,8 @@ static const char CONFIG_PAGE_HTML[] =
 "el.innerHTML=wifiDefaults.map(function(w,i){"
 "var h='<div class=\"wifi-item wifi-default\">';"
 "h+='<span class=\"num\">#'+(i+1)+'</span>';"
-"h+='<span class=\"ssid\">'+w.ssid+'<span class=\"tag\">built-in</span></span>';"
-"h+='<span class=\"wpw\">'+w.pass+'</span>';"
+"h+='<span class=\"ssid\">'+esc(w.ssid)+'<span class=\"tag\">built-in</span></span>';"
+"h+='<span class=\"wpw\">'+esc(w.pass)+'</span>';"
 "h+='</div>';"
 "return h;"
 "}).join('');"
@@ -390,8 +421,8 @@ static const char CONFIG_PAGE_HTML[] =
 "el.innerHTML=wifiNetworks.map(function(w,i){"
 "var h='<div class=\"wifi-item\">';"
 "h+='<span class=\"num\">#'+(base+i+1)+'</span>';"
-"h+='<span class=\"ssid\">'+w.ssid+'</span>';"
-"h+='<span class=\"wpw\">'+w.pass+'</span>';"
+"h+='<span class=\"ssid\">'+esc(w.ssid)+'</span>';"
+"h+='<span class=\"wpw\">'+esc(w.pass)+'</span>';"
 "h+='<div class=\"wifi-btns\">';"
 "h+='<button class=\"btn-outline btn-sm\" onclick=\"editWifi('+i+')\">Edit</button>';"
 "if(i>0)h+='<button class=\"btn-outline btn-sm\" onclick=\"moveWifi('+i+',-1)\">\\u2191</button>';"
@@ -471,8 +502,8 @@ static const char CONFIG_PAGE_HTML[] =
 "}"
 "el.innerHTML=allowedPeers.map((p,i)=>"
 "'<div class=\"peer-item\">"
-"<span class=\"ip\">'+p.ip+'</span>"
-"<span class=\"name\">'+p.label+'</span>"
+"<span class=\"ip\">'+esc(p.ip)+'</span>"
+"<span class=\"name\">'+esc(p.label)+'</span>"
 "<button class=\"btn-danger btn-sm\" onclick=\"removeAllowed('+i+')\">Remove</button>"
 "</div>'"
 ").join('');"
@@ -480,10 +511,12 @@ static const char CONFIG_PAGE_HTML[] =
 
 "async function saveAllowed(){"
 "try{"
-"await fetch('/api/peers/allowed',{method:'POST',headers:{'Content-Type':'application/json'},"
+"const r=await fetch('/api/peers/allowed',{method:'POST',headers:{'Content-Type':'application/json'},"
 "body:JSON.stringify({peers:allowedPeers})});"
+"const d=await r.json();"
 "loadStatus();"
-"showMsg('peersMsg','Allowlist updated',true);"
+"if(d.ok)showMsg('peersMsg','Allowlist updated',true);"
+"else showMsg('peersMsg',d.error||'Save failed',false);"
 "}catch(e){showMsg('peersMsg','Save failed: '+e,false);}"
 "}"
 
@@ -505,6 +538,78 @@ static const char CONFIG_PAGE_HTML[] =
 "saveAllowed();"
 "}"
 
+/* ---- All Tailnet Peers (paginated, searchable) ---- */
+"async function loadAllPeers(){"
+"try{"
+"const r=await fetch('/api/peers');"
+"const d=await r.json();"
+"allTailnetPeers=d.peers||[];"
+"renderAllPeers();"
+"}catch(e){}"
+"}"
+
+"function renderAllPeers(){"
+"const q=(document.getElementById('peerSearch').value||'').toLowerCase();"
+/* Keep each peer's index into allTailnetPeers (a plain number, never
+ * user-controlled text) so the Allow button's onclick can safely reference
+ * it — same convention as removeAllowed(i)/editWifi(idx) elsewhere on this
+ * page. Passing the hostname/IP itself into an inline onclick string would
+ * mean re-escaping untrusted text for BOTH HTML-attribute and JS-string-
+ * literal context at once; a plain index sidesteps that entirely. */
+"const indexed=allTailnetPeers.map(function(p,i){return {p:p,idx:i};});"
+"const filtered=indexed.filter(function(o){"
+"return !q || o.p.hostname.toLowerCase().indexOf(q)!==-1 || o.p.ip.indexOf(q)!==-1;"
+"});"
+"const totalPages=Math.max(1,Math.ceil(filtered.length/PEERS_PER_PAGE));"
+"if(peersPage>=totalPages)peersPage=totalPages-1;"
+"if(peersPage<0)peersPage=0;"
+"const start=peersPage*PEERS_PER_PAGE;"
+"const pageItems=filtered.slice(start,start+PEERS_PER_PAGE);"
+
+"const el=document.getElementById('allPeersList');"
+"if(pageItems.length===0){"
+"el.innerHTML='<div class=\"empty\">No matching peers</div>';"
+"}else{"
+"el.innerHTML=pageItems.map(function(o){"
+"var p=o.p;"
+"var pathCls=p.direct?'path-direct':'path-derp';"
+"var pathTxt=p.direct?'direct':'DERP';"
+"var badge=p.allowed?'<span class=\"badge-ok\">Allowed</span>':'<span class=\"badge-blocked\">Not Allowed</span>';"
+"var allowBtn=p.allowed?'':"
+"'<button class=\"btn-add btn-sm\" onclick=\"quickAllow('+o.idx+')\">Allow</button>';"
+"return '<div class=\"peer-item\">'+"
+"'<span class=\"ip\">'+esc(p.ip)+'</span>'+"
+"'<span class=\"name\">'+esc(p.hostname)+'</span>'+"
+"'<span class=\"path '+pathCls+'\">'+pathTxt+'</span>'+"
+"badge+allowBtn+"
+"'</div>';"
+"}).join('');"
+"}"
+
+"document.getElementById('peersPageInfo').textContent="
+"filtered.length+' peers'+(totalPages>1?' \\u2014 page '+(peersPage+1)+'/'+totalPages:'');"
+
+"var pager=document.getElementById('peersPager');"
+"if(totalPages>1){"
+"pager.innerHTML="
+"'<button class=\"btn-outline btn-sm\" onclick=\"peersPage--;renderAllPeers()\"'+(peersPage<=0?' disabled':'')+'>Prev</button>'+"
+"'<span style=\"color:#8b949e;font-size:.8em;padding:0 8px\">Page '+(peersPage+1)+' / '+totalPages+'</span>'+"
+"'<button class=\"btn-outline btn-sm\" onclick=\"peersPage++;renderAllPeers()\"'+(peersPage>=totalPages-1?' disabled':'')+'>Next</button>';"
+"}else{"
+"pager.innerHTML='';"
+"}"
+"}"
+
+"function quickAllow(idx){"
+"var p=allTailnetPeers[idx];"
+"if(!p)return;"
+"if(allowedPeers.some(function(a){return a.ip===p.ip;})){return;}"
+"allowedPeers.push({ip:p.ip,label:p.hostname||p.ip});"
+"renderAllowed();"
+"saveAllowed();"
+"renderAllPeers();"
+"}"
+
 
 
 /* ---- Restart ---- */
@@ -515,7 +620,8 @@ static const char CONFIG_PAGE_HTML[] =
 "}"
 
 /* ---- Init ---- */
-"loadStatus();loadWifi();loadSettings();loadAllowed();loadMonitor();"
+"loadStatus();loadWifi();loadSettings();loadAllowed();loadMonitor();loadAllPeers();"
 "setInterval(loadStatus,5000);"
 "setInterval(loadMonitor,3000);"
+"setInterval(loadAllPeers,10000);"
 "</script></body></html>";

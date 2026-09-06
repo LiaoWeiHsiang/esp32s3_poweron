@@ -38,3 +38,8 @@ Thumbs.db
 #eim
 eim_config.toml
 examples/basic_connect/eim_config.toml
+# 本機設定(WiFi 帳密、Tailnet 名稱),範本見 local_config.example.h
+examples/*/main/local_config.h
+
+# Serial 除錯記錄(含 tailnet 裝置名稱與對外 IP)
+log*.txt

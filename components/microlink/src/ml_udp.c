@@ -244,6 +244,57 @@ void microlink_udp_close(microlink_udp_socket_t *sock) {
     ESP_LOGI(TAG, "UDP socket closed");
 }
 
+/* ============================================================================
+ * Per-peer handshake-retrigger rate limiting
+ *
+ * Small fixed-size, no-alloc table keyed by destination VPN IP. Sized for
+ * the realistic number of distinct peers one app actively sends UDP to at
+ * once (heartbeats/echo), not the full tailnet — oldest entry is evicted
+ * when full, so a peer that goes quiet just falls out and re-triggers
+ * immediately next time, which is fine.
+ * ========================================================================== */
+#define UDP_RATELIMIT_TABLE_SIZE   8
+#define UDP_RATELIMIT_INTERVAL_MS  10000
+
+typedef struct {
+    uint32_t dest_ip;   /* 0 = empty slot */
+    uint64_t last_trigger_ms;
+} udp_ratelimit_entry_t;
+
+static udp_ratelimit_entry_t s_ratelimit_table[UDP_RATELIMIT_TABLE_SIZE];
+
+static void ml_udp_ratelimit_trigger(microlink_t *ml, uint32_t dest_ip) {
+    uint64_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+    int slot = -1;
+    int oldest_idx = 0;
+    uint64_t oldest_ms = UINT64_MAX;
+    for (int i = 0; i < UDP_RATELIMIT_TABLE_SIZE; i++) {
+        if (s_ratelimit_table[i].dest_ip == dest_ip) {
+            slot = i;
+            break;
+        }
+        if (s_ratelimit_table[i].dest_ip == 0) {
+            if (slot < 0) slot = i;  /* remember first free slot */
+        } else if (s_ratelimit_table[i].last_trigger_ms < oldest_ms) {
+            oldest_ms = s_ratelimit_table[i].last_trigger_ms;
+            oldest_idx = i;
+        }
+    }
+    if (slot < 0) slot = oldest_idx;  /* table full — evict LRU */
+
+    if (s_ratelimit_table[slot].dest_ip == dest_ip &&
+        now_ms - s_ratelimit_table[slot].last_trigger_ms <= UDP_RATELIMIT_INTERVAL_MS) {
+        return;  /* still within this peer's cooldown */
+    }
+
+    s_ratelimit_table[slot].dest_ip = dest_ip;
+    s_ratelimit_table[slot].last_trigger_ms = now_ms;
+
+    ml_wg_mgr_trigger_handshake(ml, dest_ip);
+    ml_wg_mgr_send_cmm(ml, dest_ip);
+}
+
 esp_err_t microlink_udp_send(microlink_udp_socket_t *sock, uint32_t dest_ip,
                               uint16_t dest_port, const void *data, size_t len) {
     if (!sock || !sock->pcb || !data || len == 0) return ESP_ERR_INVALID_ARG;
@@ -257,20 +308,22 @@ esp_err_t microlink_udp_send(microlink_udp_socket_t *sock, uint32_t dest_ip,
 
     memcpy(p->payload, data, len);
     err_t err = udp_sendto(sock->pcb, p, &dest, dest_port);
+    /* udp_sendto() never takes ownership of our pbuf (success or failure) —
+     * caller must always free its own reference. */
     pbuf_free(p);
 
     if (err != ERR_OK) {
         if (sock->ml) {
-            /* Rate-limit handshake retrigger: max once per 10 seconds per socket.
-             * Without this, high-frequency heartbeats each trigger a full WG handshake
-             * initiation + CallMeMaybe, flooding the DERP TX queue. */
-            static uint64_t last_trigger_ms = 0;
-            uint64_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            if (now_ms - last_trigger_ms > 10000) {
-                last_trigger_ms = now_ms;
-                ml_wg_mgr_trigger_handshake(sock->ml, dest_ip);
-                ml_wg_mgr_send_cmm(sock->ml, dest_ip);
-            }
+            /* Rate-limit handshake retrigger: max once per 10 seconds PER
+             * DESTINATION PEER. This used to be one function-local `static`
+             * shared by every socket and every dest_ip — a send failure to
+             * peer A would suppress peer B's re-trigger too, for up to 10s,
+             * delaying reconnection to an otherwise-healthy peer after a
+             * real network change. Without rate-limiting at all,
+             * high-frequency heartbeats to one peer would trigger a full WG
+             * handshake + CallMeMaybe on every send, flooding the DERP TX
+             * queue — so this still needs to throttle, just per-peer. */
+            ml_udp_ratelimit_trigger(sock->ml, dest_ip);
         }
         return ESP_FAIL;
     }

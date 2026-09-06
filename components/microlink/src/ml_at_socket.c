@@ -79,6 +79,12 @@ typedef struct {
     volatile size_t rx_head;    /* Write position */
     volatile size_t rx_tail;    /* Read position */
     size_t rx_size;             /* Ring buffer capacity */
+    /* Guards rx_buf itself (alloc/free) and every ring_read/ring_write/
+     * ring_used access against ml_at_close() freeing it concurrently.
+     * Created once per slot in ml_at_socket_init() and kept alive across
+     * close()/reuse cycles — only torn down at ml_at_socket_deinit(), so a
+     * recv() blocked waiting on it is never left holding a deleted handle. */
+    SemaphoreHandle_t rx_lock;
 
     /* Last UDP source (from +RECV FROM URC) */
     uint32_t last_src_ip;
@@ -124,6 +130,34 @@ static size_t ring_read(ml_at_sock_t *s, uint8_t *data, size_t len) {
         s->rx_tail = (s->rx_tail + 1) % s->rx_size;
     }
     return read_count;
+}
+
+/* Locked wrappers — take rx_lock, re-check rx_buf is still allocated (a
+ * concurrent ml_at_close() on this same slot may have freed it since the
+ * caller's fd_to_sock() check), and only then touch the ring. This is what
+ * every caller outside this file's own close() path should use. */
+static size_t ring_used_locked(ml_at_sock_t *s) {
+    size_t used = 0;
+    xSemaphoreTake(s->rx_lock, portMAX_DELAY);
+    if (s->rx_buf) used = ring_used(s);
+    xSemaphoreGive(s->rx_lock);
+    return used;
+}
+
+static size_t ring_read_locked(ml_at_sock_t *s, uint8_t *data, size_t len) {
+    size_t n = 0;
+    xSemaphoreTake(s->rx_lock, portMAX_DELAY);
+    if (s->rx_buf) n = ring_read(s, data, len);
+    xSemaphoreGive(s->rx_lock);
+    return n;
+}
+
+static size_t ring_write_locked(ml_at_sock_t *s, const uint8_t *data, size_t len) {
+    size_t n = 0;
+    xSemaphoreTake(s->rx_lock, portMAX_DELAY);
+    if (s->rx_buf) n = ring_write(s, data, len);
+    xSemaphoreGive(s->rx_lock);
+    return n;
 }
 
 /* ============================================================================
@@ -492,7 +526,7 @@ static int at_read_data_chunk(int link_num, int max_bytes, int *out_remaining)
                         /* Write any data bytes that came with the header read */
                         if (data_already > 0 && actual_len > 0) {
                             int to_write = (data_already > actual_len) ? actual_len : data_already;
-                            ring_write(s, (const uint8_t *)(nl + 1), to_write);
+                            ring_write_locked(s, (const uint8_t *)(nl + 1), to_write);
                             actual_len -= to_write;
                         }
                         break;
@@ -523,20 +557,45 @@ static int at_read_data_chunk(int link_num, int max_bytes, int *out_remaining)
      * Use a large buffer to minimize uart_read_bytes() calls (each call has
      * timeout overhead even when data is available). */
     uint8_t chunk[1460];
+    bool lost_data = false;
     while (actual_len > 0 && (esp_timer_get_time() - start) < timeout_us) {
         int want = (actual_len > (int)sizeof(chunk)) ? (int)sizeof(chunk) : actual_len;
         int n = uart_read_bytes(UART_NUM, chunk, want, pdMS_TO_TICKS(20));
         if (n > 0) {
-            size_t w = ring_write(s, chunk, n);
+            size_t w = ring_write_locked(s, chunk, n);
             total_written += (int)w;
             actual_len -= n;
+            if (w < (size_t)n) {
+                /* Ring buffer filled mid-chunk — the rest of this UART read
+                 * has nowhere to go and is dropped. */
+                lost_data = true;
+            }
         }
+    }
+    if (actual_len > 0) {
+        /* Timed out before consuming everything the modem said it was
+         * sending for this chunk. The unread bytes are still sitting ahead
+         * of us in the UART stream and the next at_read_data_chunk() call
+         * flushes the input before issuing its own AT+CIPRXGET — so those
+         * bytes are gone, not just delayed. That's a silent gap in the TCP
+         * byte stream with nothing downstream able to detect it. */
+        lost_data = true;
     }
 
     /* Phase 3: Consume trailing \r\nOK\r\n (don't care about exact content).
      * Short timeout — data is already flowing, just need to clear the tail. */
     uint8_t trail[32];
     uart_read_bytes(UART_NUM, trail, sizeof(trail), pdMS_TO_TICKS(5));
+
+    if (lost_data) {
+        ESP_LOGE(TAG, "link=%d: %d bytes of this chunk never arrived (timeout or full ring) "
+                 "— stream integrity lost, forcing socket closed", link_num, actual_len);
+        /* Don't let the caller keep reading a TCP stream with an
+         * undetectable hole in it — surface it as EOF/error, same signal
+         * ml_at_recv() already checks for a remote-initiated close. */
+        s->closed_by_remote = true;
+        remaining = 0; /* stop the outer at_read_data() drain loop too */
+    }
 
     if (out_remaining) *out_remaining = remaining;
 
@@ -586,6 +645,15 @@ esp_err_t ml_at_socket_init(void)
     /* Initialize socket array */
     for (int i = 0; i < AT_SOCK_MAX; i++) {
         s_at.socks[i].link_num = -1; /* Free */
+        s_at.socks[i].rx_lock = xSemaphoreCreateMutex();
+        if (!s_at.socks[i].rx_lock) {
+            ESP_LOGE(TAG, "Failed to create rx_lock for slot %d", i);
+            for (int j = 0; j < i; j++) {
+                vSemaphoreDelete(s_at.socks[j].rx_lock);
+                s_at.socks[j].rx_lock = NULL;
+            }
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     /* Create AT mutex */
@@ -656,6 +724,15 @@ void ml_at_socket_deinit(void)
     if (s_at.at_mutex) {
         vSemaphoreDelete(s_at.at_mutex);
         s_at.at_mutex = NULL;
+    }
+
+    /* Every socket was closed above, so nothing should still be blocked in
+     * ml_at_recv() waiting on these — safe to tear down now. */
+    for (int i = 0; i < AT_SOCK_MAX; i++) {
+        if (s_at.socks[i].rx_lock) {
+            vSemaphoreDelete(s_at.socks[i].rx_lock);
+            s_at.socks[i].rx_lock = NULL;
+        }
     }
 
     s_at.initialized = false;
@@ -801,6 +878,21 @@ int ml_at_connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
     }
 
     ESP_LOGW(TAG, "connect: link %d failed: %s", s->link_num, resp);
+
+    /* The +CIPOPEN URC may simply have arrived late (dropped/delayed past
+     * AT_LONG_TIMEOUT_MS) and the modem could have actually completed the
+     * open — in which case link_num is now "ghost connected" on the modem
+     * side even though we're about to report failure. Proactively close it
+     * here rather than relying on the caller to do so; AT+CIPCLOSE on a link
+     * that never actually opened is a harmless no-op/error on the modem. */
+    {
+        char close_cmd[32];
+        snprintf(close_cmd, sizeof(close_cmd), "AT+CIPCLOSE=%d", s->link_num);
+        xSemaphoreTake(s_at.at_mutex, portMAX_DELAY);
+        at_cmd_ok(close_cmd, AT_TIMEOUT_MS);
+        xSemaphoreGive(s_at.at_mutex);
+    }
+
     errno = ECONNREFUSED;
     return -1;
 }
@@ -882,10 +974,10 @@ ssize_t ml_at_recv(int fd, void *buf, size_t len, int flags)
     if (!s) { errno = EBADF; return -1; }
 
     /* Check ring buffer first — fast path, no AT commands */
-    size_t avail = ring_used(s);
+    size_t avail = ring_used_locked(s);
     if (avail > 0) {
         size_t to_read = (avail < len) ? avail : len;
-        return ring_read(s, (uint8_t *)buf, to_read);
+        return ring_read_locked(s, (uint8_t *)buf, to_read);
     }
 
     /* Check if remote closed */
@@ -896,16 +988,18 @@ ssize_t ml_at_recv(int fd, void *buf, size_t len, int flags)
     /* Non-blocking mode */
     if (s->nonblocking) {
         xSemaphoreTake(s_at.at_mutex, portMAX_DELAY);
-        int pending = at_query_pending(s->link_num);
+        int pending = (s->link_num >= 0) ? at_query_pending(s->link_num) : -1;
         if (pending > 0) {
             at_read_data(s->link_num, pending, NULL);
         }
         xSemaphoreGive(s_at.at_mutex);
 
-        avail = ring_used(s);
+        if (s->link_num < 0) { errno = EBADF; return -1; } /* closed concurrently */
+
+        avail = ring_used_locked(s);
         if (avail > 0) {
             size_t to_read = (avail < len) ? avail : len;
-            return ring_read(s, (uint8_t *)buf, to_read);
+            return ring_read_locked(s, (uint8_t *)buf, to_read);
         }
         errno = EAGAIN;
         return -1;
@@ -934,7 +1028,7 @@ ssize_t ml_at_recv(int fd, void *buf, size_t len, int flags)
         xSemaphoreTake(s_at.at_mutex, portMAX_DELAY);
         int total_drained = 0;
         int remaining = 0;
-        int pending = at_query_pending(s->link_num);
+        int pending = (s->link_num >= 0) ? at_query_pending(s->link_num) : -1;
         if (pending > 0) {
             /* at_read_data drains ALL pending data in a loop internally */
             int got = at_read_data(s->link_num, pending, &remaining);
@@ -945,15 +1039,17 @@ ssize_t ml_at_recv(int fd, void *buf, size_t len, int flags)
         }
         xSemaphoreGive(s_at.at_mutex);
 
+        if (s->link_num < 0) { errno = EBADF; return -1; } /* closed concurrently */
+
         if (total_drained > 0) {
             ESP_LOGI(TAG, "DRAIN: link=%d drained=%d remaining=%d", s->link_num, total_drained, remaining);
         }
 
         /* Return data if available */
-        avail = ring_used(s);
+        avail = ring_used_locked(s);
         if (avail > 0) {
             size_t to_read = (avail < len) ? avail : len;
-            return ring_read(s, (uint8_t *)buf, to_read);
+            return ring_read_locked(s, (uint8_t *)buf, to_read);
         }
 
         /* Check remote close */
@@ -1094,7 +1190,11 @@ int ml_at_close(int fd)
     at_cmd_ok(cmd, AT_TIMEOUT_MS);
     xSemaphoreGive(s_at.at_mutex);
 
-    /* Free resources */
+    /* Free resources. Holding rx_lock here means we can't free rx_buf out
+     * from under a concurrent ml_at_recv()/select() on this same fd that's
+     * mid-ring_read()/ring_used() — they hold the same lock for those calls
+     * (see below) and will see link_num < 0 the next time they check. */
+    xSemaphoreTake(s->rx_lock, portMAX_DELAY);
     if (s->rx_buf) {
         free(s->rx_buf);
         s->rx_buf = NULL;
@@ -1103,6 +1203,7 @@ int ml_at_close(int fd)
     s->link_num = -1;
     s->connected = false;
     s->closed_by_remote = false;
+    xSemaphoreGive(s->rx_lock);
 
     return 0;
 }
@@ -1202,7 +1303,7 @@ int ml_at_select(int nfds, fd_set *readfds, fd_set *writefds,
             if (!s) continue;
 
             if (readfds && FD_ISSET(fd, readfds)) {
-                if (ring_used(s) > 0 || s->closed_by_remote) {
+                if (ring_used_locked(s) > 0 || s->closed_by_remote) {
                     FD_SET(fd, &rd_result);
                     ready_count++;
                 }
@@ -1224,13 +1325,13 @@ int ml_at_select(int nfds, fd_set *readfds, fd_set *writefds,
             ml_at_sock_t *s = fd_to_sock(fd);
             if (!s) continue;
 
-            if (readfds && FD_ISSET(fd, readfds) && ring_used(s) == 0) {
-                int pending = at_query_pending(s->link_num);
+            if (readfds && FD_ISSET(fd, readfds) && ring_used_locked(s) == 0) {
+                int pending = (s->link_num >= 0) ? at_query_pending(s->link_num) : -1;
                 if (pending > 0) {
                     at_read_data(s->link_num, pending, NULL);
                 }
 
-                if (ring_used(s) > 0) {
+                if (s->link_num >= 0 && ring_used_locked(s) > 0) {
                     FD_SET(fd, &rd_result);
                     ready_count++;
                 }

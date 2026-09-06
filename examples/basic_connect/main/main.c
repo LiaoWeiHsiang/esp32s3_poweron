@@ -17,6 +17,10 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "driver/gpio.h"
+#include "driver/rmt_tx.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "esp_http_server.h"
 #include "esp_timer.h"
 #include "esp_crt_bundle.h"
@@ -33,18 +37,49 @@ static const char *TAG = "main";
  * in source code. Configure CONFIG_ML_TAILSCALE_API_KEY in menuconfig or
  * sdkconfig.credentials before building.
  */
-#define TAILSCALE_TAILNET      "zxc741852741@gmail.com"  // Tailnet 名稱/Email
+/* Tailnet 名稱與 WiFi 帳密放在 local_config.h(已 gitignore),
+ * 範本是 local_config.example.h。剛 clone 下來沒有前者也能編譯。 */
+#if defined(__has_include) && __has_include("local_config.h")
+#  include "local_config.h"
+#else
+#  include "local_config.example.h"
+#  warning "沒有 local_config.h,改用範本值。請 cp local_config.example.h local_config.h 後填入實際值。"
+#endif
 
 /* === 繼電器硬體設定 === */
 #define RELAY_GPIO           GPIO_NUM_4   // 繼電器控制腳位
 #define RELAY_ACTIVE_LEVEL   1            // 0: 低電位觸發, 1: 高電位觸發
 #define RELAY_INACTIVE_LEVEL (!RELAY_ACTIVE_LEVEL)
 
+/* === 繼電器動作回授 ===
+ * 接線位置：繼電器模組上驅動電晶體的集極腳,等同於線圈「-」端(不是 COM/NO/NC
+ * 那組跟 PC 電源開關排針相連的乾接點!接到那組會破壞繼電器原本提供的隔離)。
+ * 這個節點平常被線圈經 VCC 拉高,電晶體導通(繼電器啟動)時被拉到接近 GND。
+ *
+ * 用 ADC 而不是數位讀取的原因:實測待機約 2.0V、觸發約 0.5V。2.0V 落在 ESP32
+ * 數位輸入的模糊地帶(判定高電位的門檻約 0.75 × 3.3V = 2.475V),用
+ * gpio_get_level() 讀會不穩定;改用 ADC 讀實際電壓再跟門檻比較,兩個狀態差距
+ * 夠大,判讀非常可靠,而且不用改動已經接好的分壓電路。
+ *
+ * GPIO6 在 ESP32-S3 上對應 ADC1_CHANNEL_5。換腳位的話這兩個常數要一起改。
+ * 沒接線也沒關係,韌體會照樣運作,只是永遠讀到接近 0mV(浮接)而已。 */
+#define RELAY_FEEDBACK_GPIO         GPIO_NUM_6
+#define RELAY_FEEDBACK_ADC_UNIT     ADC_UNIT_1
+#define RELAY_FEEDBACK_ADC_CHANNEL  ADC_CHANNEL_5
+/* 低於這個毫伏數 = 繼電器已啟動。取實測 2000mV / 500mV 的中間值,兩邊各留
+ * 約 750mV 餘裕,電源波動或分壓電阻誤差都不會誤判。 */
+#define RELAY_FEEDBACK_THRESHOLD_MV 1250
+
 /* === 板載 RGB LED === */
 #define BOARD_RGB_GPIO       GPIO_NUM_48 
 
 static TimerHandle_t relay_timer = NULL;
 static httpd_handle_t server_handle = NULL;
+
+/* 回授 ADC。cali_handle 可能為 NULL(晶片沒燒校正資料時),那種情況下就退回
+ * 用原始 ADC 讀值換算,精度差一點但仍足以區分 2.0V / 0.5V 這種大差距。 */
+static adc_oneshot_unit_handle_t s_fb_adc = NULL;
+static adc_cali_handle_t s_fb_adc_cali = NULL;
 
 /* WiFi network list — firmware-baked defaults (always tried first, not
  * user-editable) followed by the web UI's NVS-backed list (lower priority,
@@ -59,13 +94,7 @@ typedef struct {
 } wifi_cred_t;
 
 /* Built-in default networks — tried before anything added via the web UI. */
-static const wifi_cred_t k_default_wifi_creds[WIFI_DEFAULT_COUNT] = {
-    { "EnglishTsai",     "22222222" },
-    { "Developer",       "22222222" },
-    { "wifi-671",        "035596933" },
-    { "wifi-671_2.4G",   "035596933" },
-    //{ "Hydra",           "K5x48Vz3" },
-};
+static const wifi_cred_t k_default_wifi_creds[WIFI_DEFAULT_COUNT] = { WIFI_CRED_LIST };
 
 static wifi_cred_t g_wifi_creds[WIFI_MAX_NETWORKS];
 static size_t g_wifi_count = 0;
@@ -84,12 +113,16 @@ typedef struct {
     uint32_t last_trigger_ms;
     char last_action[32];
     uint32_t total_triggers;
+    bool last_confirmed;     /* Feedback voltage dropped below the threshold after triggering */
+    int last_feedback_mv;    /* 實際量到的毫伏數,方便在網頁上直接看到、必要時調門檻 */
 } relay_log_t;
 
 static relay_log_t g_relay_log = {
     .last_trigger_ms = 0,
     .last_action = "無",
-    .total_triggers = 0
+    .total_triggers = 0,
+    .last_confirmed = false,
+    .last_feedback_mv = -1
 };
 
 /* ============================================================================
@@ -297,20 +330,99 @@ static void init_relay_hardware(void) {
     };
     gpio_config(&io_conf);
 
+    /* Feedback pin as ADC input. No internal pull-up here — the external
+     * divider already defines the voltage, and a pull-up would skew it. */
+    adc_oneshot_unit_init_cfg_t adc_cfg = {
+        .unit_id = RELAY_FEEDBACK_ADC_UNIT,
+    };
+    esp_err_t err = adc_oneshot_new_unit(&adc_cfg, &s_fb_adc);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Feedback ADC unit init failed: %s", esp_err_to_name(err));
+        s_fb_adc = NULL;
+    } else {
+        adc_oneshot_chan_cfg_t chan_cfg = {
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+            /* 12dB attenuation → usable range roughly 0-3.1V, covers both the
+             * ~2.0V idle and ~0.5V triggered levels with room to spare. */
+            .atten = ADC_ATTEN_DB_12,
+        };
+        err = adc_oneshot_config_channel(s_fb_adc, RELAY_FEEDBACK_ADC_CHANNEL, &chan_cfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Feedback ADC channel config failed: %s", esp_err_to_name(err));
+        }
+
+        /* Calibration is optional — if the chip has no calibration data burned
+         * in, we fall back to a rough linear conversion in read_feedback_mv(). */
+        adc_cali_curve_fitting_config_t cali_cfg = {
+            .unit_id = RELAY_FEEDBACK_ADC_UNIT,
+            .chan = RELAY_FEEDBACK_ADC_CHANNEL,
+            .atten = ADC_ATTEN_DB_12,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        if (adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_fb_adc_cali) != ESP_OK) {
+            ESP_LOGW(TAG, "Feedback ADC calibration unavailable — using raw conversion");
+            s_fb_adc_cali = NULL;
+        }
+        ESP_LOGI(TAG, "Feedback ADC ready on GPIO%d (threshold %dmV)",
+                 RELAY_FEEDBACK_GPIO, RELAY_FEEDBACK_THRESHOLD_MV);
+    }
+
     relay_timer = xTimerCreate("relay_tmr", pdMS_TO_TICKS(1000), pdFALSE, NULL, relay_timer_callback);
 }
 
-static void trigger_relay_async(uint32_t duration_ms, const char *action_desc) {
-    if (!relay_timer) return;
+/* Reads the feedback divider voltage in millivolts, or -1 if the ADC isn't
+ * available. Averages a few samples since a switching relay driver puts some
+ * noise on this node. */
+static int read_feedback_mv(void) {
+    if (!s_fb_adc) return -1;
+
+    int total_mv = 0;
+    int samples = 0;
+    for (int i = 0; i < 4; i++) {
+        int raw = 0;
+        if (adc_oneshot_read(s_fb_adc, RELAY_FEEDBACK_ADC_CHANNEL, &raw) != ESP_OK) continue;
+
+        int mv = 0;
+        if (s_fb_adc_cali) {
+            if (adc_cali_raw_to_voltage(s_fb_adc_cali, raw, &mv) != ESP_OK) continue;
+        } else {
+            /* Uncalibrated fallback: 12-bit full scale ≈ 3100mV at 12dB atten. */
+            mv = (raw * 3100) / 4095;
+        }
+        total_mv += mv;
+        samples++;
+    }
+
+    return samples > 0 ? (total_mv / samples) : -1;
+}
+
+/* Returns true if the feedback voltage confirmed the relay actually energized
+ * (see the RELAY_FEEDBACK_GPIO wiring note above) — false if unconfirmed,
+ * which with nothing wired to that pin is the expected/harmless default. */
+static bool trigger_relay_async(uint32_t duration_ms, const char *action_desc) {
+    if (!relay_timer) return false;
     gpio_set_level(RELAY_GPIO, RELAY_ACTIVE_LEVEL);
-    ESP_LOGI(TAG, "Relay ACTIVATED for %lu ms (%s)", (unsigned long)duration_ms, action_desc);
+
+    /* Let the coil/contacts actually settle before sampling feedback —
+     * small relays are electrically done well within this, and this runs
+     * in the httpd worker task so a short block here is fine. */
+    vTaskDelay(pdMS_TO_TICKS(30));
+    int fb_mv = read_feedback_mv();
+    bool confirmed = (fb_mv >= 0 && fb_mv < RELAY_FEEDBACK_THRESHOLD_MV);
+
+    ESP_LOGI(TAG, "Relay ACTIVATED for %lu ms (%s) — feedback %dmV, %s",
+             (unsigned long)duration_ms, action_desc, fb_mv,
+             confirmed ? "CONFIRMED" : "not confirmed");
 
     g_relay_log.last_trigger_ms = (uint32_t)(esp_timer_get_time() / 1000000);
     snprintf(g_relay_log.last_action, sizeof(g_relay_log.last_action), "%s (%lums)", action_desc, (unsigned long)duration_ms);
     g_relay_log.total_triggers++;
+    g_relay_log.last_confirmed = confirmed;
+    g_relay_log.last_feedback_mv = fb_mv;
 
     xTimerChangePeriod(relay_timer, pdMS_TO_TICKS(duration_ms), 0);
     xTimerStart(relay_timer, 0);
+    return confirmed;
 }
 
 /* ============================================================================
@@ -333,10 +445,11 @@ static uint32_t parse_ms_param(httpd_req_t *req, uint32_t default_ms) {
 
 static esp_err_t power_click_handler(httpd_req_t *req) {
     uint32_t ms = parse_ms_param(req, 1000);
-    trigger_relay_async(ms, "Pulse/Click");
+    bool confirmed = trigger_relay_async(ms, "Pulse/Click");
 
-    // 優化：直接回傳寫好的固定 JSON，避免寫入過多格式化字串造成延遲
-    const char *resp = "{\"status\":\"success\",\"action\":\"pulse\"}";
+    char resp[96];
+    snprintf(resp, sizeof(resp), "{\"status\":\"success\",\"action\":\"pulse\",\"confirmed\":%s,\"feedback_mv\":%d}",
+             confirmed ? "true" : "false", g_relay_log.last_feedback_mv);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -344,9 +457,11 @@ static esp_err_t power_click_handler(httpd_req_t *req) {
 
 static esp_err_t power_hold_handler(httpd_req_t *req) {
     uint32_t ms = parse_ms_param(req, 5000);
-    trigger_relay_async(ms, "Hold/Force Shutdown");
+    bool confirmed = trigger_relay_async(ms, "Hold/Force Shutdown");
 
-    const char *resp = "{\"status\":\"success\",\"action\":\"hold\"}";
+    char resp[96];
+    snprintf(resp, sizeof(resp), "{\"status\":\"success\",\"action\":\"hold\",\"confirmed\":%s,\"feedback_mv\":%d}",
+             confirmed ? "true" : "false", g_relay_log.last_feedback_mv);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -403,12 +518,20 @@ static esp_err_t sysinfo_api_handler(httpd_req_t *req) {
         "\"free_heap\":%lu,"
         "\"last_trigger_sec\":%lu,"
         "\"last_action\":\"%s\","
-        "\"total_triggers\":%lu"
+        "\"total_triggers\":%lu,"
+        "\"last_confirmed\":%s,"
+        "\"last_feedback_mv\":%d,"
+        "\"feedback_now_mv\":%d,"
+        "\"feedback_threshold_mv\":%d"
         "}",
         (unsigned long)uptime_sec, rssi, (unsigned long)free_heap,
         (unsigned long)g_relay_log.last_trigger_ms,
         g_relay_log.last_action,
-        (unsigned long)g_relay_log.total_triggers);
+        (unsigned long)g_relay_log.total_triggers,
+        g_relay_log.last_confirmed ? "true" : "false",
+        g_relay_log.last_feedback_mv,
+        read_feedback_mv(),
+        RELAY_FEEDBACK_THRESHOLD_MV);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
@@ -451,7 +574,12 @@ h3 { margin: 0 0 10px 0; font-size: 15px; color: #aaa; border-bottom: 1px solid 
 .duration-inputs select { flex: 1; }
 .duration-inputs input { width: 90px; text-align: center; }
 .email-tag { color: #888; font-size: 11px; margin-top: 2px; display: block; }
+.nav-bar { max-width: 450px; margin: 0 auto 12px auto; text-align: right; }
+.nav-link { color: #888; font-size: 13px; text-decoration: none; padding: 5px 12px; border: 1px solid #333; border-radius: 12px; transition: color 0.15s, border-color 0.15s; }
+.nav-link:hover { color: #3b82f6; border-color: #3b82f6; }
 </style></head><body>
+
+<div class="nav-bar"><a href="/" class="nav-link">&#8592; MicroLink</a></div>
 
 <div class="card">
 <h2>ESP32-S3 開機控制面板</h2>
@@ -488,6 +616,8 @@ h3 { margin: 0 0 10px 0; font-size: 15px; color: #aaa; border-bottom: 1px solid 
 <div class="info-row"><span>Wi-Fi 訊號 (RSSI)</span><span id="rssi" class="info-val">--</span></div>
 <div class="info-row"><span>記憶體殘量 (Free Heap)</span><span id="heap" class="info-val">--</span></div>
 <div class="info-row"><span>上次繼電器動作</span><span id="lastAction" class="info-val">--</span></div>
+<div class="info-row"><span>動作確認(回授)</span><span id="lastConfirmed" class="info-val">--</span></div>
+<div class="info-row"><span>回授電壓(目前 / 上次觸發)</span><span id="feedbackMv" class="info-val">--</span></div>
 <div class="info-row"><span>累計觸發次數</span><span id="totalTriggers" class="info-val">--</span></div>
 </div>
 </div>
@@ -514,8 +644,14 @@ function sendCmd(path){
   fetch(path, { cache: 'no-store' })
   .then(r => r.json())
   .then(d => {
-    msg.style.color = '#10b981';
-    msg.innerText = '觸發成功';
+    var mv = (d.feedback_mv != null && d.feedback_mv >= 0) ? ' (' + d.feedback_mv + 'mV)' : '';
+    if(d.confirmed){
+      msg.style.color = '#10b981';
+      msg.innerText = '✓ 已確認繼電器動作' + mv;
+    }else{
+      msg.style.color = '#f59e0b';
+      msg.innerText = '⚠ 指令已送出,但回授電壓沒降到門檻以下' + mv;
+    }
     setTimeout(updateSysInfo, 500);
   })
   .catch(e => {
@@ -565,6 +701,13 @@ function updateSysInfo(){
     document.getElementById('heap').innerText = (d.free_heap / 1024).toFixed(1) + ' KB';
     document.getElementById('lastAction').innerText = d.last_action;
     document.getElementById('totalTriggers').innerText = d.total_triggers + ' 次';
+    var lc = document.getElementById('lastConfirmed');
+    lc.innerText = d.last_confirmed ? '✓ 已確認' : '⚠ 未偵測到';
+    lc.style.color = d.last_confirmed ? '#10b981' : '#f59e0b';
+    var now = (d.feedback_now_mv != null && d.feedback_now_mv >= 0) ? d.feedback_now_mv + 'mV' : 'N/A';
+    var last = (d.last_feedback_mv != null && d.last_feedback_mv >= 0) ? d.last_feedback_mv + 'mV' : '--';
+    document.getElementById('feedbackMv').innerText =
+      now + ' / ' + last + ' (門檻 ' + d.feedback_threshold_mv + 'mV)';
   }).catch(()=>{});
 }
 
@@ -621,7 +764,59 @@ static void start_custom_web_server(void) {
     ESP_LOGI(TAG, "   - PC Power Control   : http://<IP>/power");
 }
 
+/* 板載 RGB LED 是 WS2812B 這類可定址 LED,不是靠腳位高低電位控制的普通 LED——
+ * 把資料腳拉低它只會維持上一次鎖存的顏色(冷開機後常常是隨機的亮白色)。要真的
+ * 熄滅,必須送一個完整的「GRB = 0,0,0」資料訊框過去。
+ *
+ * WS2812B 協定時序(這裡用 RMT 以 10MHz 產生,1 tick = 0.1µs):
+ *   bit 0 → 高 0.3µs、低 0.9µs
+ *   bit 1 → 高 0.9µs、低 0.3µs
+ *   訊框結束 → 拉低 >50µs 讓 LED 鎖存
+ * 只在開機時送一次,送完就把 RMT channel 釋放掉。 */
 static void turn_off_board_rgb(void) {
+    rmt_channel_handle_t chan = NULL;
+    rmt_tx_channel_config_t tx_cfg = {
+        .gpio_num = BOARD_RGB_GPIO,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10 * 1000 * 1000,  /* 10MHz → 1 tick = 0.1µs */
+        .mem_block_symbols = 64,
+        .trans_queue_depth = 4,
+    };
+    if (rmt_new_tx_channel(&tx_cfg, &chan) != ESP_OK) {
+        ESP_LOGW(TAG, "RGB LED: RMT channel init failed, LED may stay lit");
+        return;
+    }
+
+    rmt_encoder_handle_t enc = NULL;
+    rmt_copy_encoder_config_t copy_cfg = {};
+    if (rmt_new_copy_encoder(&copy_cfg, &enc) != ESP_OK) {
+        rmt_del_channel(chan);
+        return;
+    }
+
+    /* 24 個 bit-0(GRB 全零)+ 結尾 50µs 低電位 */
+    rmt_symbol_word_t frame[25];
+    for (int i = 0; i < 24; i++) {
+        frame[i].level0 = 1; frame[i].duration0 = 3;   /* T0H 0.3µs */
+        frame[i].level1 = 0; frame[i].duration1 = 9;   /* T0L 0.9µs */
+    }
+    frame[24].level0 = 0; frame[24].duration0 = 250;   /* 25µs */
+    frame[24].level1 = 0; frame[24].duration1 = 250;   /* +25µs = 50µs reset */
+
+    rmt_transmit_config_t tx_conf = { .loop_count = 0 };
+    if (rmt_enable(chan) == ESP_OK) {
+        rmt_transmit(chan, enc, frame, sizeof(frame), &tx_conf);
+        rmt_tx_wait_all_done(chan, 100);
+        rmt_disable(chan);
+        ESP_LOGI(TAG, "Board RGB LED turned off");
+    }
+
+    rmt_del_encoder(enc);
+    rmt_del_channel(chan);
+
+    /* 送完「全黑」訊框後,把資料腳固定拉低。單獨拉低不能讓 WS2812B 熄滅(這是
+     * 原本那版無效的原因),但在訊框送完之後拉低有意義:讓資料線保持安靜,避免
+     * 浮接時被雜訊干擾、又被 latch 成隨機顏色。 */
     gpio_reset_pin(BOARD_RGB_GPIO);
     gpio_set_direction(BOARD_RGB_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_level(BOARD_RGB_GPIO, 0);

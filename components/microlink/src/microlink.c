@@ -184,6 +184,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->stun_sock = -1;
     ml->stun_sock6 = -1;
     ml->derp.sockfd = -1;
+    ml->derp.last_good_node_idx = -1;
 
     /* Resolve timing (0 = use defaults from #defines) */
     ml->t_disco_heartbeat_ms = ml->config.disco_heartbeat_ms ? ml->config.disco_heartbeat_ms : ML_DISCO_HEARTBEAT_MS;
@@ -286,8 +287,11 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->coord_cmd_queue = xQueueCreate(ML_COORD_CMD_QUEUE_DEPTH, sizeof(ml_coord_cmd_t));
     ml->peer_update_queue = xQueueCreate(ML_PEER_UPDATE_QUEUE_DEPTH, sizeof(ml_peer_update_t *));
 
+    ml->peers_lock = xSemaphoreCreateMutex();
+
     if (!ml->derp_tx_queue || !ml->disco_rx_queue || !ml->wg_rx_queue ||
-        !ml->stun_rx_queue || !ml->coord_cmd_queue || !ml->peer_update_queue) {
+        !ml->stun_rx_queue || !ml->coord_cmd_queue || !ml->peer_update_queue ||
+        !ml->peers_lock) {
         ESP_LOGE(TAG, "Failed to create queues");
         microlink_destroy(ml);
         return NULL;
@@ -443,10 +447,51 @@ esp_err_t microlink_rebind(microlink_t *ml) {
     if (old_stun6 >= 0) ml_close_sock(old_stun6);
     ESP_LOGI(TAG, "Rebind: closed DISCO + STUN sockets");
 
+    /* Step 1b: Clear every peer's learned direct-path state. best_ip/
+     * best_port/trust_until_ms were discovered by DISCO on the OLD network
+     * interface — a LAN endpoint in particular is almost certainly wrong
+     * after a WiFi<->cellular switch or even a WiFi->WiFi hop to a different
+     * router, but nothing here previously invalidated them. Left alone, WG
+     * output and DISCO kept preferring that stale address until
+     * trust_until_ms happened to expire on its own, stalling real traffic
+     * recovery well after the socket layer had already rebound. Forcing
+     * has_direct_path=false makes every peer fall back to DERP immediately
+     * and re-run DISCO to rediscover (and re-validate) a direct path on the
+     * new interface, rather than trusting a stale one. */
+    xSemaphoreTake(ml->peers_lock, portMAX_DELAY);
+    int cleared = 0;
+    for (int i = 0; i < ml->peer_count; i++) {
+        ml_peer_t *p = &ml->peers[i];
+        if (!p->active) continue;
+        if (p->has_direct_path || p->best_ip != 0 || p->trust_until_ms != 0) {
+            p->has_direct_path = false;
+            p->best_ip = 0;
+            p->best_port = 0;
+            p->trust_until_ms = 0;
+            cleared++;
+        }
+    }
+    xSemaphoreGive(ml->peers_lock);
+    ESP_LOGI(TAG, "Rebind: cleared stale direct-path state for %d peer(s)", cleared);
+
     /* Step 2: Signal coord to reconnect. ML_CMD_FORCE_RECONNECT closes
      * the coord socket, resets Noise state, and re-enters the
      * STUN → DNS → TCP → Noise → Register → MapRequest flow.
-     * Peers and WG state are preserved. */
+     * Peers and WG state are preserved.
+     *
+     * coord_task only checks coord_cmd_queue once per outer-loop iteration —
+     * the state handlers themselves (noise handshake, register, fetch
+     * peers) run long blocking ml_recv() calls with SO_RCVTIMEO as high as
+     * 60s, so if FORCE_RECONNECT arrives mid-call it would previously sit
+     * unprocessed until that call finally timed out or errored on its own.
+     * Closing coord_sock directly (same invalidate-then-close ordering as
+     * the DISCO/STUN sockets above) unblocks a coord_task thread that's
+     * currently parked in one of those recv() calls immediately, instead of
+     * waiting out the rest of its timeout. */
+    int old_coord_sock = ml->coord_sock;
+    ml->coord_sock = -1;
+    if (old_coord_sock >= 0) ml_close_sock(old_coord_sock);
+
     xEventGroupClearBits(ml->events, ML_EVT_COORD_REGISTERED);
     ml_coord_cmd_t cmd = ML_CMD_FORCE_RECONNECT;
     xQueueSend(ml->coord_cmd_queue, &cmd, pdMS_TO_TICKS(100));
@@ -522,8 +567,23 @@ void microlink_set_default_wifi_list(microlink_t *ml, const char (*ssids)[33],
 
 esp_err_t microlink_stop(microlink_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
+    if (ml->state == ML_STATE_IDLE) return ESP_OK;  /* already stopped — idempotent */
 
     ESP_LOGI(TAG, "Stopping...");
+
+    /* Stop the HTTP config server FIRST, before anything else. It's reachable
+     * from any tailnet peer, and GET /api/monitor reads net_io_task/derp_tx_task/
+     * coord_task/wg_mgr_task. Those tasks self-delete (vTaskDelete(NULL)) once
+     * ML_EVT_SHUTDOWN_REQUEST is set below, but the handles below aren't NULLed
+     * until after a 3s wait — so a request that lands in that window would read
+     * already-freed FreeRTOS task-control-block memory. microlink_stop() runs on
+     * every WiFi/cellular failover (not just app shutdown), so that window opens
+     * routinely, not just once at teardown. Closing the server first means there's
+     * no listener left to receive that request at all. */
+    if (ml->config_httpd) {
+        ml_config_httpd_stop(ml->config_httpd);
+    }
+
     xEventGroupSetBits(ml->events, ML_EVT_SHUTDOWN_REQUEST);
 
     /* Wait for tasks to exit (they check ML_EVT_SHUTDOWN_REQUEST).
@@ -537,11 +597,6 @@ esp_err_t microlink_stop(microlink_t *ml) {
     ml->derp_tx_task = NULL;
     ml->coord_task = NULL;
     ml->wg_mgr_task = NULL;
-
-    /* Stop HTTP config server */
-    if (ml->config_httpd) {
-        ml_config_httpd_stop(ml->config_httpd);
-    }
 
     /* Clean up zero-copy PCB if active */
 #ifdef CONFIG_ML_ZERO_COPY_WG
@@ -582,6 +637,7 @@ void microlink_destroy(microlink_t *ml) {
 
     /* Delete event group */
     if (ml->events) vEventGroupDelete(ml->events);
+    if (ml->peers_lock) vSemaphoreDelete(ml->peers_lock);
 
     /* Clear keys from memory */
     memset(ml->machine_private_key, 0, 32);
@@ -613,16 +669,25 @@ int microlink_get_peer_count(const microlink_t *ml) {
 }
 
 esp_err_t microlink_get_peer_info(const microlink_t *ml, int index, microlink_peer_info_t *info) {
-    if (!ml || !info || index < 0 || index >= ml->peer_count) {
-        return ESP_ERR_INVALID_ARG;
+    if (!ml || !info) return ESP_ERR_INVALID_ARG;
+
+    /* peers[] is normally owned exclusively by wg_mgr_task; this is a public
+     * API any app task can call concurrently with wg_mgr updating the same
+     * entries, so take peers_lock to avoid handing back a torn read (e.g.
+     * hostname from one update mixed with vpn_ip from the next). */
+    xSemaphoreTake(ml->peers_lock, portMAX_DELAY);
+    esp_err_t ret = ESP_ERR_INVALID_ARG;
+    if (index >= 0 && index < ml->peer_count) {
+        const ml_peer_t *p = &ml->peers[index];
+        info->vpn_ip = p->vpn_ip;
+        strncpy(info->hostname, p->hostname, sizeof(info->hostname) - 1);
+        memcpy(info->public_key, p->public_key, 32);
+        info->online = p->active;
+        info->direct_path = p->has_direct_path;
+        ret = ESP_OK;
     }
-    const ml_peer_t *p = &ml->peers[index];
-    info->vpn_ip = p->vpn_ip;
-    strncpy(info->hostname, p->hostname, sizeof(info->hostname) - 1);
-    memcpy(info->public_key, p->public_key, 32);
-    info->online = p->active;
-    info->direct_path = p->has_direct_path;
-    return ESP_OK;
+    xSemaphoreGive(ml->peers_lock);
+    return ret;
 }
 
 /* ============================================================================
@@ -635,14 +700,22 @@ esp_err_t microlink_send(microlink_t *ml, uint32_t dest_vpn_ip,
     if (ml->state != ML_STATE_CONNECTED) return ESP_ERR_INVALID_STATE;
 
     /* Find peer by VPN IP */
+    xSemaphoreTake(ml->peers_lock, portMAX_DELAY);
+    uint8_t pubkey[32];
+    bool found = false;
     for (int i = 0; i < ml->peer_count; i++) {
         if (ml->peers[i].vpn_ip == dest_vpn_ip && ml->peers[i].active) {
-            /* TODO: Route through WireGuard tunnel */
-            /* For now, queue via DERP as fallback */
-            return ml_derp_queue_send(ml, ml->peers[i].public_key, data, len);
+            memcpy(pubkey, ml->peers[i].public_key, 32);
+            found = true;
+            break;
         }
     }
-    return ESP_ERR_NOT_FOUND;
+    xSemaphoreGive(ml->peers_lock);
+
+    if (!found) return ESP_ERR_NOT_FOUND;
+    /* TODO: Route through WireGuard tunnel */
+    /* For now, queue via DERP as fallback */
+    return ml_derp_queue_send(ml, pubkey, data, len);
 }
 
 /* ============================================================================
@@ -734,13 +807,16 @@ uint32_t microlink_resolve(const microlink_t *ml, const char *hostname) {
 
     size_t query_len = strlen(hostname);
 
+    xSemaphoreTake(ml->peers_lock, portMAX_DELAY);
+    uint32_t result = 0;
     for (int i = 0; i < ml->peer_count; i++) {
         const ml_peer_t *p = &ml->peers[i];
         if (!p->active || p->hostname[0] == '\0') continue;
 
         /* 1. Exact match (case-insensitive) */
         if (strncasecmp_local(p->hostname, hostname, sizeof(p->hostname)) == 0) {
-            return p->vpn_ip;
+            result = p->vpn_ip;
+            break;
         }
 
         /* 2. Prefix match: query "npc1" matches peer "npc1.tail12345.ts.net"
@@ -750,10 +826,12 @@ uint32_t microlink_resolve(const microlink_t *ml, const char *hostname) {
             size_t short_len = (size_t)(dot - p->hostname);
             if (query_len == short_len &&
                 strncasecmp_local(p->hostname, hostname, short_len) == 0) {
-                return p->vpn_ip;
+                result = p->vpn_ip;
+                break;
             }
         }
     }
+    xSemaphoreGive(ml->peers_lock);
 
-    return 0;  /* Not found */
+    return result;  /* 0 = not found */
 }

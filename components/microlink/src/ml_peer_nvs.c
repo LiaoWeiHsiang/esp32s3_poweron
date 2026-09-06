@@ -17,6 +17,8 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include <string.h>
 
 static const char *TAG = "ml_peer_nvs";
@@ -54,6 +56,11 @@ typedef struct __attribute__((packed)) {
 static nvs_handle_t s_nvs = 0;
 static bool s_initialized = false;
 static peer_nvs_table_t *s_table = NULL;  /* PSRAM-allocated working copy */
+/* Guards s_table against concurrent access — wg_mgr_task calls
+ * ml_peer_nvs_save() while the config httpd task (or app code) can call
+ * ml_peer_nvs_load_all()/ml_peer_nvs_clear() at the same time, with no
+ * synchronization previously. */
+static SemaphoreHandle_t s_lock = NULL;
 
 static void load_table(void) {
     if (!s_table) {
@@ -64,6 +71,16 @@ static void load_table(void) {
     size_t len = sizeof(peer_nvs_table_t);
     if (nvs_get_blob(s_nvs, PEER_NVS_BLOB_KEY, s_table, &len) != ESP_OK) {
         memset(s_table, 0, sizeof(peer_nvs_table_t));
+    }
+
+    /* count comes straight from flash — a torn write (power loss mid-
+     * nvs_set_blob) or a shrunk ML_NVS_MAX_PEERS in a later build could
+     * leave it larger than the entries[] array actually allocated for it.
+     * Every loop below trusts this bound, so clamp it once, here. */
+    if (s_table->count > ML_NVS_MAX_PEERS) {
+        ESP_LOGW(TAG, "Corrupt peer table count=%u > max=%d, clamping",
+                 s_table->count, ML_NVS_MAX_PEERS);
+        s_table->count = ML_NVS_MAX_PEERS;
     }
 }
 
@@ -82,6 +99,11 @@ static esp_err_t flush_table(void) {
 esp_err_t ml_peer_nvs_init(void) {
     if (s_initialized) return ESP_OK;
 
+    if (!s_lock) {
+        s_lock = xSemaphoreCreateMutex();
+        if (!s_lock) return ESP_ERR_NO_MEM;
+    }
+
     esp_err_t err = nvs_open(PEER_NVS_NAMESPACE, NVS_READWRITE, &s_nvs);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "NVS open failed: %d (peer cache disabled)", err);
@@ -99,16 +121,19 @@ esp_err_t ml_peer_nvs_init(void) {
 
 void ml_peer_nvs_deinit(void) {
     if (!s_initialized) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
     nvs_close(s_nvs);
     s_initialized = false;
     if (s_table) {
         free(s_table);
         s_table = NULL;
     }
+    xSemaphoreGive(s_lock);
 }
 
 esp_err_t ml_peer_nvs_save(const ml_peer_t *peer) {
     if (!s_initialized || !peer || !s_table) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
 
     /* Advance LRU clock */
     s_table->lru_clock++;
@@ -177,12 +202,17 @@ esp_err_t ml_peer_nvs_save(const ml_peer_t *peer) {
                  entry.hostname_short, slot, s_table->count);
     }
 
+    xSemaphoreGive(s_lock);
     return err;
 }
 
 int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers) {
     if (!s_initialized || !peers || !s_table) return 0;
-    if (s_table->count == 0) return 0;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_table->count == 0) {
+        xSemaphoreGive(s_lock);
+        return 0;
+    }
 
     int loaded = 0;
     for (int i = 0; i < s_table->count && loaded < max_peers; i++) {
@@ -219,11 +249,13 @@ int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers) {
     }
 
     ESP_LOGI(TAG, "Loaded %d cached peers from NVS", loaded);
+    xSemaphoreGive(s_lock);
     return loaded;
 }
 
 esp_err_t ml_peer_nvs_clear(void) {
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
 
     esp_err_t err = nvs_erase_all(s_nvs);
     if (err == ESP_OK) {
@@ -231,5 +263,6 @@ esp_err_t ml_peer_nvs_clear(void) {
         if (s_table) memset(s_table, 0, sizeof(peer_nvs_table_t));
         ESP_LOGI(TAG, "Peer NVS cleared");
     }
+    xSemaphoreGive(s_lock);
     return err;
 }
