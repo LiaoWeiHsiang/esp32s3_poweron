@@ -2522,7 +2522,23 @@ void ml_coord_task(void *arg) {
                     int ping_ret = noise_send(ml, &noise, ping_frame, sizeof(ping_frame));
                     if (ping_ret >= 0) {
                         last_h2_ping_ms = now;
-                        last_activity_ms = now;
+                        /* 這裡刻意「不」重置 last_activity_ms。
+                         *
+                         * noise_send() 成功只代表本機 TCP 把位元組收進送出緩衝區,
+                         * 跟伺服器有沒有收到完全無關。連線半死時(伺服器端已斷但我們
+                         * 沒收到 FIN/RST,NAT 逾時或伺服器靜默丟棄都會這樣),寫入會
+                         * 繼續成功很久。
+                         *
+                         * 之前在這裡重置 watchdog,而 PING 每 5 秒送一次、watchdog
+                         * 門檻是 120 秒,等於 watchdog 被自己餵飽、永遠不會觸發:
+                         * 裝置會一直停在 COORD_LONG_POLL 以為自己還連著,但控制平面
+                         * 早就把它標成離線,遠端 peer 因此找不到它(同網段的 peer 靠
+                         * DISCO 直連仍然正常,所以症狀是「區網連得到、外面連不到」)。
+                         *
+                         * watchdog 只能由「真的收到伺服器資料」重置,見下方
+                         * poll_map_update() 回傳 > 0 的分支。伺服器對這個 PING 的
+                         * PONG 回應也會走那條路徑,所以正常連線時 watchdog 依然會被
+                         * 持續重置,不會誤判。 */
                     } else {
                         ESP_LOGW(TAG, "H2 PING send failed, reconnecting");
                         state = COORD_RECONNECTING;
