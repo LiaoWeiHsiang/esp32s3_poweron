@@ -1468,12 +1468,40 @@ err_t wireguardif_connect_derp(struct netif *netif, u8_t peer_index) {
 		// Without this, wireguardif_peer_output() will try UDP to old endpoint
 		ip_addr_set_any(false, &peer->ip);
 		peer->port = 0;
+		// connect_ip must go too: wireguardif_connect() and should_reset_peer()
+		// both copy connect_ip back into ip, which would silently undo the
+		// fallback and send us back to the endpoint we just decided is dead.
+		// A later direct DISCO packet repopulates it via update_endpoint().
+		ip_addr_set_any(false, &peer->connect_ip);
+		peer->connect_port = 0;
 		// Force immediate handshake - clear last_initiation_tx to bypass REKEY_TIMEOUT
 		// This is safe because DISCO has confirmed the path works
 		peer->last_initiation_tx = 0;
 		// Now start handshake immediately
 		wireguard_start_handshake(netif, peer);
 		result = ERR_OK;
+	}
+	return result;
+}
+
+/* Forget a peer's direct UDP endpoint so all output falls back to DERP.
+ *
+ * Unlike wireguardif_connect_derp(), this does NOT touch active/send_handshake:
+ * it is meant for peers that have no session yet, where forcing a handshake would
+ * start a 5s retry loop against a peer that may not have us configured at all.
+ *
+ * connect_ip must be cleared too, not just ip: wireguardif_connect() copies
+ * connect_ip back into ip, and should_reset_peer() does the same in the periodic
+ * timer. Leaving connect_ip populated means the stale endpoint gets restored and
+ * the peer silently reverts to the dead direct path. */
+err_t wireguardif_clear_endpoint(struct netif *netif, u8_t peer_index) {
+	struct wireguard_peer *peer;
+	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
+	if (result == ERR_OK) {
+		ip_addr_set_any(false, &peer->ip);
+		peer->port = 0;
+		ip_addr_set_any(false, &peer->connect_ip);
+		peer->connect_port = 0;
 	}
 	return result;
 }

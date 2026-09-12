@@ -1510,6 +1510,23 @@ static void disco_periodic_probes(microlink_t *ml) {
                     if (is_up == ERR_OK) {
                         wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
                         ESP_LOGI(TAG, "  WG session active, falling back to DERP for %s", p->hostname);
+                    } else {
+                        /* No session yet — this is the case that used to deadlock.
+                         *
+                         * wireguardif_peer_is_up() only returns ERR_OK once a keypair
+                         * exists, so gating the DERP fallback on it meant a peer that
+                         * never managed to establish a session kept its stale direct
+                         * endpoint forever. wireguardif_peer_output() routes to DERP
+                         * only when peer->ip is unset, so every handshake attempt went
+                         * on going to a dead address (e.g. the phone's old LAN IP after
+                         * it moved to cellular) and the session could never come up —
+                         * the fallback was gated on the very thing it had to fix.
+                         *
+                         * Symptom: device online in the control plane, same-LAN peers
+                         * fine, remote peers time out. Just forget the endpoint; DERP
+                         * takes over and a fresh direct path re-populates it later. */
+                        wireguardif_clear_endpoint(netif, (u8_t)p->wg_peer_index);
+                        ESP_LOGI(TAG, "  No WG session, cleared stale endpoint for %s (DERP only)", p->hostname);
                     }
                 }
 
