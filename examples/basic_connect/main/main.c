@@ -85,20 +85,41 @@ static adc_cali_handle_t s_fb_adc_cali = NULL;
  * user-editable) followed by the web UI's NVS-backed list (lower priority,
  * editable at http://<vpn-ip>/ -> WiFi Networks). Tries each in order until
  * one connects, and keeps cycling through the combined list on disconnect. */
-#define WIFI_DEFAULT_COUNT   4
-#define WIFI_MAX_NETWORKS    (WIFI_DEFAULT_COUNT + ML_CONFIG_MAX_WIFI_ENTRIES)
-
 typedef struct {
     char ssid[33];
     char password[65];
 } wifi_cred_t;
 
 /* Built-in default networks — tried before anything added via the web UI. */
-static const wifi_cred_t k_default_wifi_creds[WIFI_DEFAULT_COUNT] = { WIFI_CRED_LIST };
+static const wifi_cred_t k_default_wifi_creds[] = { WIFI_CRED_LIST };
+
+/* 從清單本身推導,不要寫死。WIFI_CRED_LIST 在 gitignore 的 local_config.h 裡,
+ * 這個數字卻在版控的 main.c 裡,手動維護兩邊一定會走散:寫多了會安靜地註冊
+ * 幾組空白 SSID(乾淨 clone 退回用只有兩筆的範本時就正好踩到),寫少了則是
+ * 新加的網路根本不會被嘗試。
+ * 轉成 int 而非 size_t,讓既有的 `int i < WIFI_DEFAULT_COUNT` 迴圈與 %d 格式
+ * 維持原本語意,不會冒出 sign-compare 警告。 */
+#define WIFI_DEFAULT_COUNT   ((int)(sizeof(k_default_wifi_creds) / sizeof(k_default_wifi_creds[0])))
+#define WIFI_MAX_NETWORKS    (WIFI_DEFAULT_COUNT + ML_CONFIG_MAX_WIFI_ENTRIES)
 
 static wifi_cred_t g_wifi_creds[WIFI_MAX_NETWORKS];
 static size_t g_wifi_count = 0;
 static size_t g_wifi_next_idx = 0;
+
+/* 定時換網:每小時掃描一次,訊號真的變差時才換到目前可見最強的已設定網路。
+ *
+ * 門檻抓得保守是刻意的 —— 換到不同路由器會換 LAN IP,Tailscale peer 快取的
+ * 直連端點就失效,遠端要重新收斂一次。連線健康時完全不掃描、不干擾。 */
+#define WIFI_ROAM_INTERVAL_MS     (60 * 60 * 1000)  /* 每小時檢查一次 */
+#define WIFI_ROAM_RSSI_WEAK_DBM   (-70)             /* 高於此值視為健康,連掃都不掃 */
+#define WIFI_ROAM_MARGIN_DB       (10)              /* 候選要強這麼多才值得換,防來回跳 */
+#define WIFI_ROAM_MAX_AP          (24)              /* 單次掃描取回的 AP 數上限 */
+#define WIFI_ROAM_GUARD_MS        (30 * 1000)       /* 換網旗標的逾時保險 */
+
+/* 我們自己發起的斷線。斷線處理器看到這個就不把 g_wifi_next_idx 往後推,
+ * 否則會連到清單的下一個而不是剛掃出來最強的那個。 */
+static volatile bool     g_wifi_roaming = false;
+static volatile uint32_t g_wifi_roam_started_ms = 0;
 
 static EventGroupHandle_t wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
@@ -862,7 +883,18 @@ static void wifi_set_config(size_t idx) {
     idx %= g_wifi_count;
 
     wifi_config_t wifi_config = {
-        .sta = { .threshold.authmode = WIFI_AUTH_WPA2_PSK },
+        .sta = {
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            /* 預設是 WIFI_FAST_SCAN —— 找到第一個同名 AP 就連,不管它多弱。
+             * 掃完所有頻道再挑,同一個 SSID 有多台 AP(mesh/分享器)時才會連到
+             * 最強的那台。代價:每次連線嘗試從約 0.3s 變成約 2s。 */
+            .scan_method = WIFI_ALL_CHANNEL_SCAN,
+            .sort_method = WIFI_CONNECT_AP_BY_SIGNAL,  /* 本來就是預設值,寫明確 */
+            /* 802.11k/v:讓支援的路由器主動把我們引導到更好的 AP,
+             * 這段換手完全在驅動裡完成,不需要我們斷線重連。 */
+            .btm_enabled = 1,
+            .rm_enabled  = 1,
+        },
     };
     strncpy((char *)wifi_config.sta.ssid, g_wifi_creds[idx].ssid, sizeof(wifi_config.sta.ssid) - 1);
     strncpy((char *)wifi_config.sta.password, g_wifi_creds[idx].password, sizeof(wifi_config.sta.password) - 1);
@@ -884,9 +916,26 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         wifi_try_next();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
-        ESP_LOGW(TAG, "Wi-Fi disconnected (reason=%d), cycling to next network in list...", disc ? disc->reason : -1);
-        if (g_wifi_count > 0) {
-            g_wifi_next_idx = (g_wifi_next_idx + 1) % g_wifi_count;
+
+        /* 這次斷線是換網流程自己造成的嗎?是的話 g_wifi_next_idx 已經被
+         * wifi_roam_task() 指向掃出來最強的那個,不能再往後推 —— 否則會連到
+         * 清單的下一個網路,整個換網決定等於白做。
+         *
+         * GUARD_MS 是保險:萬一 esp_wifi_disconnect() 沒產生事件,旗標不會
+         * 永久卡住而讓之後真正的斷線失去輪詢能力。 */
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        bool roaming = g_wifi_roaming &&
+                       (now_ms - g_wifi_roam_started_ms) < WIFI_ROAM_GUARD_MS;
+        g_wifi_roaming = false;  /* 一次性:接下來再斷線就恢復正常輪詢 */
+
+        if (roaming) {
+            ESP_LOGI(TAG, "Wi-Fi disconnected (reason=%d) by roam, connecting to chosen network...",
+                     disc ? disc->reason : -1);
+        } else {
+            ESP_LOGW(TAG, "Wi-Fi disconnected (reason=%d), cycling to next network in list...", disc ? disc->reason : -1);
+            if (g_wifi_count > 0) {
+                g_wifi_next_idx = (g_wifi_next_idx + 1) % g_wifi_count;
+            }
         }
         wifi_try_next();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -901,6 +950,117 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                 ESP_LOGE(TAG, "microlink_rebind failed: %s", esp_err_to_name(rb_err));
             }
         }
+    }
+}
+
+/* 每小時檢查一次是否該換到訊號更強的網路。
+ *
+ * 只有「目前訊號已經很差」才會真的去掃描:單天線的 station 掃描時要離開目前頻道
+ * 約 2 秒,期間封包會掉(本專案設 WIFI_PS_NONE,AP 不會替我們暫存),所以連線健康
+ * 時完全不掃、不干擾。跨 SSID 換網還會換 LAN IP,讓 Tailscale peer 快取的直連
+ * 端點失效,因此門檻抓得保守。 */
+static void wifi_roam_task(void *arg) {
+    (void)arg;
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(WIFI_ROAM_INTERVAL_MS));
+
+        /* 用 esp_wifi_sta_get_ap_info() 判斷是否連線中,不要用 WIFI_CONNECTED_BIT:
+         * 那個 bit 在 GOT_IP 被設起之後從來沒有人清掉(它只是開機時的一次性閘門),
+         * 拿來當「現在是否連著」會永遠為真。 */
+        wifi_ap_record_t cur;
+        if (esp_wifi_sta_get_ap_info(&cur) != ESP_OK) {
+            continue;  /* 沒連上 —— 既有的斷線輪詢邏輯會處理,不要插手 */
+        }
+        if (cur.rssi >= WIFI_ROAM_RSSI_WEAK_DBM) {
+            continue;  /* 訊號健康。平常都走這條 */
+        }
+        if (g_wifi_count == 0) {
+            continue;
+        }
+
+        ESP_LOGI(TAG, "WiFi roam: current \"%s\" RSSI=%d dBm is weak, scanning...",
+                 (const char *)cur.ssid, cur.rssi);
+
+        wifi_scan_config_t scan_cfg = {
+            .ssid = NULL,
+            .bssid = NULL,
+            .channel = 0,
+            .show_hidden = false,
+            .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+            .scan_time.active = { .min = 100, .max = 200 },
+        };
+        esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "WiFi roam: scan failed: %s", esp_err_to_name(err));
+            esp_wifi_clear_ap_list();
+            continue;
+        }
+
+        uint16_t n = WIFI_ROAM_MAX_AP;
+        wifi_ap_record_t *aps = calloc(n, sizeof(wifi_ap_record_t));
+        if (!aps) {
+            /* 掃描結果沒被取走的話,驅動內部那份 AP 清單不會自己釋放。 */
+            esp_wifi_clear_ap_list();
+            continue;
+        }
+        /* 成功取回時驅動會一併釋放內部清單,不需要再 clear。 */
+        err = esp_wifi_scan_get_ap_records(&n, aps);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "WiFi roam: get records failed: %s", esp_err_to_name(err));
+            free(aps);
+            esp_wifi_clear_ap_list();
+            continue;
+        }
+
+        /* 對照已設定的清單,挑出此刻真的看得到、訊號最強的那一個。 */
+        int best_idx = -1;
+        int best_rssi = -127;
+        for (size_t i = 0; i < g_wifi_count; i++) {
+            /* 同一個 SSID 可能有多台 AP,取其中最強的當這個網路的代表值。 */
+            int seen_rssi = -127;
+            for (uint16_t a = 0; a < n; a++) {
+                if (strncmp(g_wifi_creds[i].ssid, (const char *)aps[a].ssid,
+                            sizeof(aps[a].ssid)) != 0) {
+                    continue;
+                }
+                if (aps[a].rssi > seen_rssi) {
+                    seen_rssi = aps[a].rssi;
+                }
+            }
+            if (seen_rssi == -127) {
+                continue;  /* 這個已設定的網路此刻掃不到 */
+            }
+            /* 把每個候選都印出來:門檻要調多少、附近到底有沒有別的選擇,
+             * 只看勝出者是判斷不出來的。 */
+            ESP_LOGI(TAG, "WiFi roam:   candidate \"%s\" %d dBm",
+                     g_wifi_creds[i].ssid, seen_rssi);
+            if (seen_rssi > best_rssi) {
+                best_rssi = seen_rssi;
+                best_idx = (int)i;
+            }
+        }
+        ESP_LOGI(TAG, "WiFi roam: scan saw %u AP(s) total", (unsigned)n);
+        free(aps);
+
+        if (best_idx < 0) {
+            ESP_LOGI(TAG, "WiFi roam: no configured network visible, staying put");
+            continue;
+        }
+        if (best_rssi < cur.rssi + WIFI_ROAM_MARGIN_DB) {
+            ESP_LOGI(TAG, "WiFi roam: best \"%s\" %d dBm not %d dB better than current %d dBm, staying put",
+                     g_wifi_creds[best_idx].ssid, best_rssi, WIFI_ROAM_MARGIN_DB, cur.rssi);
+            continue;
+        }
+
+        ESP_LOGW(TAG, "WiFi roam: switching to \"%s\" (%d dBm) from \"%s\" (%d dBm)",
+                 g_wifi_creds[best_idx].ssid, best_rssi, (const char *)cur.ssid, cur.rssi);
+
+        /* 順序很重要:旗標必須在 disconnect 之前設好,斷線事件可能立刻就來。 */
+        g_wifi_roam_started_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        g_wifi_roaming = true;
+        g_wifi_next_idx = (size_t)best_idx;
+        esp_wifi_disconnect();
     }
 }
 
@@ -981,6 +1141,9 @@ void app_main(void) {
 
     // 優化：將 API Task 優先級降為 2 (避免搶占 HTTPd 5 與其他即時 Task)
     xTaskCreate(fetch_tailscale_devices_task, "ts_api_task", 8192, NULL, 2, NULL);
+
+    /* 每小時檢查一次 WiFi 訊號,必要時換到更強的網路(細節見 wifi_roam_task)。 */
+    xTaskCreate(wifi_roam_task, "wifi_roam", 4096, NULL, 2, NULL);
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
